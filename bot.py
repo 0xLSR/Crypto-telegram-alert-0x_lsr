@@ -19,6 +19,8 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
+import wallet as solana_wallet
+
 API_BASE = "https://api.telegram.org/bot{token}/{method}"
 GECKO_BASE = "https://api.geckoterminal.com/api/v2"
 DEX_BASE = "https://api.dexscreener.com"
@@ -27,6 +29,10 @@ TELEGRAM_POLL_TIMEOUT_SECONDS = 1
 TELEGRAM_REQUEST_TIMEOUT_SECONDS = 15
 API_REQUEST_TIMEOUT_SECONDS = 15
 PRICE_CHECK_SECONDS = max(15, int(os.getenv("PRICE_CHECK_SECONDS", "60")))
+try:
+    WALLET_CHECK_INTERVAL_SECONDS = max(15, int(os.getenv("WALLET_CHECK_INTERVAL_SECONDS", "60")))
+except ValueError:
+    WALLET_CHECK_INTERVAL_SECONDS = 60
 MAX_WATCHES = 100
 PRICE_LOOKUPS: dict[str, str] = {}
 LOG = logging.getLogger("crypto_alert_bot")
@@ -125,7 +131,7 @@ def env_float(name: str, default: float, minimum: float, maximum: float) -> floa
 
 def load_state() -> dict[str, Any]:
     if not STATE_FILE.exists():
-        return {"offset": 0, "watches": {}, "awaiting_add": {}, "pending_add": {}}
+        return {"offset": 0, "watches": {}, "awaiting_add": {}, "pending_add": {}, "wallets": {}, "awaiting_wallet": {}}
     try:
         value = json.loads(STATE_FILE.read_text(encoding="utf-8"))
         if not isinstance(value, dict) or not isinstance(value.get("watches", {}), dict):
@@ -165,10 +171,52 @@ def load_state() -> dict[str, Any]:
         for chat_id, pending in pending_add.items():
             if isinstance(pending, dict) and is_valid_solana_address(pending.get("address")) and isinstance(pending.get("pair"), dict):
                 clean_pending[str(chat_id)] = pending
-        return {"offset": offset, "watches": watches, "awaiting_add": awaiting_add, "pending_add": clean_pending}
+        raw_wallets = value.get("wallets", {})
+        if not isinstance(raw_wallets, dict):
+            raw_wallets = {}
+        wallets: dict[str, Any] = {}
+        for user_id, entry in raw_wallets.items():
+            if not isinstance(entry, dict) or not is_valid_solana_address(entry.get("address")):
+                continue
+            history = entry.get("history", [])
+            clean_history = []
+            if isinstance(history, list):
+                for item in history[-20:]:
+                    if not isinstance(item, dict) or not isinstance(item.get("signature"), str):
+                        continue
+                    assets = []
+                    if isinstance(item.get("assets", []), list):
+                        for asset in item.get("assets", [])[:3]:
+                            if isinstance(asset, dict) and isinstance(asset.get("mint"), str) and isinstance(asset.get("amount"), str):
+                                assets.append({"mint": asset["mint"], "amount": asset["amount"],
+                                               "decimals": str(asset.get("decimals", "0"))})
+                    clean_history.append({
+                        "signature": item["signature"],
+                        "classification": str(item.get("classification") or "🔄 Movimentação detectada"),
+                        "timestamp": item.get("timestamp"),
+                        "assets": assets,
+                    })
+            if not str(user_id).isdigit():
+                continue
+            wallets[str(user_id)] = {
+                "address": entry["address"],
+                "chat_id": str(entry.get("chat_id", "")),
+                "monitoring_enabled": bool(entry.get("monitoring_enabled", True)),
+                "alerts_enabled": bool(entry.get("alerts_enabled", True)),
+                "last_signature": entry.get("last_signature") if isinstance(entry.get("last_signature"), str) else None,
+                "last_check": entry.get("last_check") if isinstance(entry.get("last_check"), (int, float)) else None,
+                "registered_at": entry.get("registered_at") if isinstance(entry.get("registered_at"), (int, float)) else time.time(),
+                "history": clean_history,
+            }
+        awaiting_wallet = value.get("awaiting_wallet", {})
+        if not isinstance(awaiting_wallet, dict):
+            awaiting_wallet = {}
+        safe_awaiting_wallet = {str(user_id): str(chat_id) for user_id, chat_id in awaiting_wallet.items() if str(user_id).isdigit()}
+        return {"offset": offset, "watches": watches, "awaiting_add": awaiting_add, "pending_add": clean_pending,
+                "wallets": wallets, "awaiting_wallet": safe_awaiting_wallet}
     except (OSError, json.JSONDecodeError, ValueError) as exc:
         LOG.error("Estado salvo inválido ou inacessível; iniciando sem offset avançado e sem watches: %s", exc)
-        return {"offset": 0, "watches": {}, "awaiting_add": {}, "pending_add": {}}
+        return {"offset": 0, "watches": {}, "awaiting_add": {}, "pending_add": {}, "wallets": {}, "awaiting_wallet": {}}
 
 
 def save_state(state: dict[str, Any]) -> None:
@@ -547,6 +595,120 @@ def pair_links_markup(pair: dict[str, Any]) -> dict[str, Any] | None:
     return {"inline_keyboard": [rows]} if rows else None
 
 
+def wallet_key(user_id: str | int) -> str:
+    return str(user_id)
+
+
+def current_wallet(state: dict[str, Any], user_id: str | int, chat_id: str | int) -> dict[str, Any] | None:
+    with STATE_LOCK:
+        wallet = state.setdefault("wallets", {}).get(wallet_key(user_id))
+        if wallet and wallet.get("chat_id") == str(chat_id):
+            return dict(wallet)
+    return None
+
+
+def wallet_short_address(address: str) -> str:
+    return short_address(address)
+
+
+def wallet_amount(value: Any) -> str:
+    try:
+        number = Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError):
+        return "indisponível"
+    if not number.is_finite():
+        return "indisponível"
+    return format(number, "f").rstrip("0").rstrip(".") if "." in format(number, "f") else format(number, "f")
+
+
+def wallet_usd(value: Any) -> str:
+    try:
+        amount = Decimal(str(value)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    except (InvalidOperation, TypeError, ValueError):
+        return "indisponível"
+    return money(amount)
+
+
+def wallet_markup(wallet: dict[str, Any] | None) -> dict[str, Any]:
+    if not wallet:
+        return {"inline_keyboard": [[button("➕ Cadastrar carteira", "wallet_add")], [button("⬅️ Voltar", "menu")]]}
+    return {"inline_keyboard": [
+        [button("📊 Ver carteira", "wallet_view"), button("🔄 Atualizar", "wallet_refresh")],
+        [button("📜 Histórico", "wallet_history"), button("🔔 Alertas da carteira", "wallet_alerts")],
+        [button("🗑️ Remover carteira", "wallet_remove")],
+        [button("⬅️ Voltar", "menu")],
+    ]}
+
+
+def wallet_info_text(address: str, info: dict[str, Any], wallet: dict[str, Any], *, details: bool = False) -> str:
+    status = "🟢 Monitoramento ativo" if wallet.get("monitoring_enabled", True) else "⏸️ Monitoramento pausado"
+    updated = time.strftime("%H:%M:%S", time.localtime())
+    text = ("💼 MINHA CARTEIRA\n\n"
+            f"Status: {status}\n\nCarteira: {wallet_short_address(address)}\n\n"
+            f"💰 Saldo SOL: {wallet_amount(info.get('sol'))} SOL\n")
+    sol_price = info.get("sol_price_usd")
+    if sol_price is not None:
+        text += f"Preço SOL: {money(sol_price)}\n"
+    estimated = info.get("estimated_usd")
+    text += f"\n💵 Valor estimado: {wallet_usd(estimated) if estimated is not None else 'indisponível'}\n"
+    text += f"🪙 Tokens: {int(info.get('token_count', 0))} ativos\n"
+    if details:
+        tokens = info.get("tokens", [])
+        if tokens:
+            for item in tokens:
+                label = item.get("symbol") or item.get("name") or "Token não identificado"
+                text += f"\n🪙 {label}\nQuantidade: {wallet_amount(item.get('amount'))}\n"
+                if item.get("price_usd") is not None:
+                    text += f"Preço: {money(item['price_usd'])}\nValor: {wallet_usd(item.get('value_usd'))}\n"
+                else:
+                    text += "Preço: indisponível\n"
+        else:
+            text += "\nNenhum token SPL ativo encontrado.\n"
+        text += "\n📊 PnL\nIndisponível nesta versão\n"
+    checked = wallet.get("last_check")
+    if isinstance(checked, (int, float)):
+        updated = time.strftime("%H:%M:%S", time.localtime(checked))
+    return text + f"\nÚltima atualização: {updated}"
+
+
+def wallet_menu_text(state: dict[str, Any], user_id: str | int, chat_id: str | int) -> tuple[str, dict[str, Any] | None]:
+    wallet = current_wallet(state, user_id, chat_id)
+    if not wallet:
+        return ("💼 MINHA CARTEIRA\n\nNenhuma carteira cadastrada.\n\n"
+                "Cadastre o endereço público da sua carteira Solana para começar o monitoramento.", None)
+    LOG.info("[WALLET] Checking wallet %s", wallet_short_address(wallet["address"]))
+    info = solana_wallet.get_wallet_info(wallet["address"], get_market_data)
+    return wallet_info_text(wallet["address"], info, wallet), wallet
+
+
+def wallet_history_screen(wallet: dict[str, Any] | None) -> tuple[str, dict[str, Any]]:
+    if not wallet:
+        return "📜 HISTÓRICO DA CARTEIRA\n\nNenhuma carteira cadastrada.", back_markup("wallet_menu")
+    items = list(wallet.get("history", []))[:10]
+    if not items:
+        return "📜 HISTÓRICO DA CARTEIRA\n\nNenhuma movimentação recente foi encontrada.", back_markup("wallet_menu")
+    lines = []
+    buttons = []
+    for item in items:
+        classification = item.get("classification") or "🔄 Movimentação detectada"
+        timestamp = item.get("timestamp")
+        ago = "horário indisponível"
+        if isinstance(timestamp, (int, float)):
+            seconds = max(0, int(time.time() - timestamp))
+            ago = f"há {seconds // 60} min" if seconds < 3600 else f"há {seconds // 3600}h"
+        assets = item.get("assets") or []
+        token_label = "Token não identificado"
+        if assets:
+            token_label = f"Token {wallet_short_address(assets[0].get('mint', ''))} · {wallet_amount(assets[0].get('amount'))}"
+        lines.append(f"{classification}\n{token_label}\n💵 Valor: indisponível · {ago}")
+        signature = item.get("signature")
+        if isinstance(signature, str) and signature:
+            buttons.append({"text": "🔎 Ver", "url": f"https://solscan.io/tx/{urllib.parse.quote(signature, safe='')}"})
+    markup_rows = [[button] for button in buttons]
+    markup_rows.append([{"text": "⬅️ Voltar", "callback_data": "wallet_menu"}])
+    return "📜 HISTÓRICO DA CARTEIRA\n\n" + "\n\n".join(lines), {"inline_keyboard": markup_rows}
+
+
 def token_callback_id(address: str) -> str:
     """Compact, non-secret callback identifier; full addresses stay in state.json."""
     return hashlib.blake2s(address.encode("utf-8"), digest_size=6).hexdigest()
@@ -574,6 +736,7 @@ def main_menu_markup() -> dict[str, Any]:
     return {"inline_keyboard": [
         [button("💰 Consultar preço", "price_menu"), button("🔔 Meus alertas", "alerts")],
         [button("➕ Adicionar token", "add_begin"), button("📋 Minha lista", "watch_list")],
+        [button("💼 Minha carteira", "wallet_menu")],
         [button("ℹ️ Ajuda", "help")],
     ]}
 
@@ -734,9 +897,11 @@ def save_pair_to_watch(state: dict[str, Any], address: str, chat_id: int | str,
 def help_text() -> str:
     return ("ℹ️ AJUDA\n\n🚀 Este bot permite:\n\n"
         "💰 Consultar preços de tokens Solana\n🔔 Criar alertas de variação\n"
-        "📋 Gerenciar sua lista de tokens\n📊 Acompanhar dados de mercado\n\n"
+        "📋 Gerenciar sua lista de tokens\n📊 Acompanhar dados de mercado\n"
+        "💼 Consultar uma carteira Solana pública\n\n"
         "Como usar:\n\n1️⃣ Toque em \"Consultar preço\"\n2️⃣ Escolha um token\n"
-        "3️⃣ Para adicionar outro, toque em \"Adicionar token\"\n\n"
+        "3️⃣ Para adicionar outro, toque em \"Adicionar token\"\n"
+        "4️⃣ Para acompanhar uma carteira pública, toque em \"Minha carteira\"\n\n"
         "Comandos disponíveis:\n/start — abrir o menu\n/price — consultar preço\n"
         "/list — minha lista\n/watch — adicionar alerta\n/unwatch — remover alerta\n/help — ajuda\n\n"
         "Os comandos ficam apenas como referência técnica.")
@@ -757,6 +922,47 @@ def begin_add_flow(state: dict[str, Any], token: str, chat_id: int | str,
         show_callback_screen(token, chat_id, message, text, back_markup())
     else:
         send_message(token, chat_id, text, back_markup())
+
+
+def begin_wallet_add(state: dict[str, Any], token: str, chat_id: int | str, user_id: str,
+                     message: dict[str, Any] | None = None) -> None:
+    if not user_id.isdigit():
+        text = "Não consegui identificar sua conta do Telegram. Abra o bot em uma conversa privada e tente novamente."
+        if message is not None:
+            show_callback_screen(token, chat_id, message, text, back_markup("wallet_menu"))
+        else:
+            send_message(token, chat_id, text, back_markup("wallet_menu"))
+        return
+    chat_key = str(chat_id)
+    with STATE_LOCK:
+        state.setdefault("awaiting_wallet", {})[user_id] = chat_key
+        state.setdefault("awaiting_add", {}).pop(chat_key, None)
+        state.setdefault("pending_add", {}).pop(chat_key, None)
+        save_state(state)
+    text = ("📥 Envie o endereço público da sua carteira Solana.\n\n"
+            "⚠️ Envie SOMENTE o endereço público.\nNunca envie seed phrase ou chave privada.")
+    markup = back_markup("wallet_menu")
+    if message is not None:
+        show_callback_screen(token, chat_id, message, text, markup)
+    else:
+        send_message(token, chat_id, text, markup)
+
+
+def register_wallet(state: dict[str, Any], user_id: str, chat_id: int | str, address: str,
+                    last_signature: str | None = None) -> None:
+    # Read-only wallet record: public address and monitoring metadata only; no signing credentials.
+    state.setdefault("wallets", {})[user_id] = {
+        "address": address,
+        "chat_id": str(chat_id),
+        "monitoring_enabled": True,
+        "alerts_enabled": True,
+        "last_signature": last_signature,
+        "last_check": None,
+        "registered_at": time.time(),
+        "history": [],
+    }
+    state.setdefault("awaiting_wallet", {}).pop(user_id, None)
+    save_state(state)
 
 
 def preview_add_flow(state: dict[str, Any], token: str, chat_id: int | str, address: str) -> None:
@@ -819,18 +1025,41 @@ def handle_update(update: dict[str, Any], state: dict[str, Any], token: str, thr
     if allowed_ids and user_id not in allowed_ids:
         send_message(token, chat_id, "Acesso não autorizado.")
         return
-    raw_text = message["text"].strip()
+    incoming_text = message["text"]
+    raw_text = incoming_text.strip()
     chat_key = str(chat_id)
     with STATE_LOCK:
         state.setdefault("awaiting_add", {})
         state.setdefault("pending_add", {})
+        state.setdefault("awaiting_wallet", {})
+        state.setdefault("wallets", {})
         is_awaiting_address = chat_key in state["awaiting_add"]
+        is_awaiting_wallet = bool(user_id and state["awaiting_wallet"].get(user_id) == chat_key)
     if raw_text.casefold() == "/cancel":
         with STATE_LOCK:
             state["awaiting_add"].pop(chat_key, None)
             state["pending_add"].pop(chat_key, None)
+            state["awaiting_wallet"].pop(user_id, None)
             save_state(state)
         send_message(token, chat_id, "Operação cancelada.")
+        return
+    if is_awaiting_wallet and not raw_text.startswith("/"):
+        if incoming_text != raw_text or not is_valid_solana_address(incoming_text):
+            send_message(token, chat_id, "❌ Endereço Solana inválido.\n\nEnvie apenas o endereço público da carteira.", back_markup("wallet_menu"))
+            return
+        try:
+            with STATE_LOCK:
+                register_wallet(state, user_id, chat_id, incoming_text)
+        except Exception as exc:
+            LOG.exception("[WALLET] Could not persist public wallet for user_id=%s: %s", user_id, exc)
+            send_message(token, chat_id, "Não consegui salvar a carteira agora. Tente novamente.", back_markup("wallet_menu"))
+            return
+        LOG.info("[WALLET] Public wallet registered for user_id=%s", user_id)
+        send_message(token, chat_id,
+                     "💼 CARTEIRA CADASTRADA\n\nO monitoramento somente leitura foi ativado.\n"
+                     f"Carteira: {wallet_short_address(incoming_text)}\n\n"
+                     "Não armazenamos chaves privadas nem assinamos transações.",
+                     {"inline_keyboard": [[button("💼 Ver carteira", "wallet_menu")], [button("⬅️ Voltar", "menu")]]})
         return
     if is_awaiting_address and not raw_text.startswith("/"):
         try:
@@ -941,8 +1170,113 @@ def handle_callback_update(update: dict[str, Any], state: dict[str, Any], token:
             with STATE_LOCK:
                 state["awaiting_add"].pop(chat_key, None)
                 state["pending_add"].pop(chat_key, None)
+                if user_id:
+                    state.setdefault("awaiting_wallet", {}).pop(user_id, None)
                 save_state(state)
             show_callback_screen(token, chat_id, callback_message, start_text(), main_menu_markup())
+        elif data == "wallet_menu":
+            wallet = current_wallet(state, user_id, chat_id) if user_id.isdigit() else None
+            if not wallet:
+                text, _ = wallet_menu_text(state, user_id, chat_id) if user_id.isdigit() else (
+                    "💼 MINHA CARTEIRA\n\nNenhuma carteira cadastrada.", None)
+                show_callback_screen(token, chat_id, callback_message, text, wallet_markup(None))
+            else:
+                try:
+                    LOG.info("[WALLET] Checking wallet %s", wallet_short_address(wallet["address"]))
+                    info = solana_wallet.get_wallet_info(wallet["address"], get_market_data)
+                    wallet["last_check"] = time.time()
+                    with STATE_LOCK:
+                        state["wallets"][user_id]["last_check"] = wallet["last_check"]
+                        save_state(state)
+                    show_callback_screen(token, chat_id, callback_message,
+                                         wallet_info_text(wallet["address"], info, wallet), wallet_markup(wallet))
+                except solana_wallet.WalletRpcError as exc:
+                    LOG.warning("[WALLET] RPC error for wallet %s: %s", wallet_short_address(wallet["address"]), exc)
+                    show_callback_screen(token, chat_id, callback_message,
+                                         "⚠️ Não consegui consultar a blockchain agora.\n\nTente novamente em alguns segundos.",
+                                         wallet_markup(wallet))
+        elif data in {"wallet_view", "wallet_refresh"}:
+            wallet = current_wallet(state, user_id, chat_id) if user_id.isdigit() else None
+            if not wallet:
+                show_callback_screen(token, chat_id, callback_message, "Nenhuma carteira cadastrada.", wallet_markup(None))
+                return
+            try:
+                LOG.info("[WALLET] Checking wallet %s", wallet_short_address(wallet["address"]))
+                info = solana_wallet.get_wallet_info(wallet["address"], get_market_data)
+                wallet["last_check"] = time.time()
+                with STATE_LOCK:
+                    state["wallets"][user_id]["last_check"] = wallet["last_check"]
+                    save_state(state)
+                show_callback_screen(token, chat_id, callback_message,
+                                     wallet_info_text(wallet["address"], info, wallet, details=data == "wallet_view"),
+                                     wallet_markup(wallet))
+            except solana_wallet.WalletRpcError as exc:
+                LOG.warning("[WALLET] RPC error for wallet %s: %s", wallet_short_address(wallet["address"]), exc)
+                show_callback_screen(token, chat_id, callback_message,
+                                     "⚠️ Não consegui consultar a blockchain agora.\n\nTente novamente em alguns segundos.",
+                                     wallet_markup(wallet))
+        elif data == "wallet_add":
+            if not user_id.isdigit():
+                show_callback_screen(token, chat_id, callback_message, "Não consegui identificar sua conta do Telegram.", back_markup())
+            elif current_wallet(state, user_id, chat_id):
+                show_callback_screen(token, chat_id, callback_message, "Já existe uma carteira cadastrada nesta conversa.", wallet_markup(current_wallet(state, user_id, chat_id)))
+            else:
+                begin_wallet_add(state, token, chat_id, user_id, callback_message)
+        elif data == "wallet_history":
+            text, markup = wallet_history_screen(current_wallet(state, user_id, chat_id) if user_id.isdigit() else None)
+            show_callback_screen(token, chat_id, callback_message, text, markup)
+        elif data == "wallet_alerts":
+            wallet = current_wallet(state, user_id, chat_id) if user_id.isdigit() else None
+            if not wallet:
+                show_callback_screen(token, chat_id, callback_message, "Nenhuma carteira cadastrada.", wallet_markup(None))
+            else:
+                enabled = wallet.get("alerts_enabled", True)
+                text = "🔔 ALERTAS DA CARTEIRA\n\nStatus: 🟢 Ativados" if enabled else "🔔 ALERTAS DA CARTEIRA\n\n🔕 Alertas desativados"
+                toggle = "🔕 Desativar alertas" if enabled else "🔔 Ativar alertas"
+                show_callback_screen(token, chat_id, callback_message, text,
+                                     {"inline_keyboard": [[button(toggle, "wallet_alert_toggle")], [button("⬅️ Voltar", "wallet_menu")]]})
+        elif data == "wallet_alert_toggle":
+            wallet = current_wallet(state, user_id, chat_id) if user_id.isdigit() else None
+            if not wallet:
+                show_callback_screen(token, chat_id, callback_message, "Nenhuma carteira cadastrada.", wallet_markup(None))
+            else:
+                with STATE_LOCK:
+                    entry = state["wallets"][user_id]
+                    entry["alerts_enabled"] = not entry.get("alerts_enabled", True)
+                    save_state(state)
+                    enabled = entry["alerts_enabled"]
+                text = "🔔 ALERTAS DA CARTEIRA\n\nStatus: 🟢 Ativados" if enabled else "🔔 ALERTAS DA CARTEIRA\n\n🔕 Alertas desativados"
+                toggle = "🔕 Desativar alertas" if enabled else "🔔 Ativar alertas"
+                show_callback_screen(token, chat_id, callback_message, text,
+                                     {"inline_keyboard": [[button(toggle, "wallet_alert_toggle")], [button("⬅️ Voltar", "wallet_menu")]]})
+        elif data == "wallet_remove":
+            wallet = current_wallet(state, user_id, chat_id) if user_id.isdigit() else None
+            if not wallet:
+                show_callback_screen(token, chat_id, callback_message, "Nenhuma carteira cadastrada.", wallet_markup(None))
+            else:
+                show_callback_screen(token, chat_id, callback_message,
+                                     "⚠️ Remover carteira?\n\nIsso interromperá o monitoramento dessa carteira.",
+                                     {"inline_keyboard": [[button("✅ Sim, remover", "wallet_remove_yes"), button("❌ Cancelar", "wallet_remove_no")],
+                                                           [button("⬅️ Voltar", "wallet_menu")]]})
+        elif data == "wallet_remove_yes":
+            wallet = current_wallet(state, user_id, chat_id) if user_id.isdigit() else None
+            if wallet:
+                with STATE_LOCK:
+                    state["wallets"].pop(user_id, None)
+                    save_state(state)
+                show_callback_screen(token, chat_id, callback_message, "🗑️ Carteira removida com sucesso.", wallet_markup(None))
+            else:
+                show_callback_screen(token, chat_id, callback_message, "Nenhuma carteira cadastrada.", wallet_markup(None))
+        elif data == "wallet_remove_no":
+            wallet = current_wallet(state, user_id, chat_id) if user_id.isdigit() else None
+            if wallet:
+                try:
+                    info = solana_wallet.get_wallet_info(wallet["address"], get_market_data)
+                    show_callback_screen(token, chat_id, callback_message, wallet_info_text(wallet["address"], info, wallet), wallet_markup(wallet))
+                except solana_wallet.WalletRpcError:
+                    show_callback_screen(token, chat_id, callback_message, "💼 MINHA CARTEIRA\n\nMonitoramento ativo.", wallet_markup(wallet))
+            else:
+                show_callback_screen(token, chat_id, callback_message, "💼 MINHA CARTEIRA\n\nNenhuma carteira cadastrada.", wallet_markup(None))
         elif data == "price_menu" or data.startswith(("p_page:", "p_refresh:")):
             try:
                 page = int(data.split(":", 1)[1]) if ":" in data else 0
@@ -1158,25 +1492,146 @@ def check_prices(state: dict[str, Any], token: str, threshold: float, cooldown: 
                 LOG.warning("Dados de preço inválidos para token monitorado %s; ignorando neste ciclo: %s", address, exc)
 
 
-def market_monitor(state: dict[str, Any], token: str, threshold: float, cooldown: float) -> None:
+def wallet_movement_text(address: str, record: dict[str, Any]) -> str:
+    lines = ["🚨 MOVIMENTAÇÃO NA CARTEIRA", "", record.get("classification", "🔄 Movimentação detectada"), ""]
+    assets = record.get("assets") or []
+    if assets:
+        asset = assets[0]
+        quantity = wallet_amount(asset.get("amount"))
+        sign = "+" if not quantity.startswith("-") else ""
+        lines.extend(["🪙 Token: Token não identificado",
+                      f"Quantidade: {sign}{quantity} · {wallet_short_address(asset.get('mint', ''))}"])
+    else:
+        lines.append("🪙 Token não identificado")
+    lines.extend(["", "💵 Valor: indisponível", f"💼 Carteira: {wallet_short_address(address)}"])
+    return "\n".join(lines)
+
+
+def solscan_markup(signature: str) -> dict[str, Any]:
+    return {"inline_keyboard": [[{"text": "🔎 Ver no Solscan", "url": f"https://solscan.io/tx/{urllib.parse.quote(signature, safe='')}"}]]}
+
+
+def check_wallets(state: dict[str, Any], token: str) -> None:
+    """Check read-only wallet signatures; uncertain transaction types stay generic."""
+    with STATE_LOCK:
+        wallets = [(str(user_id), dict(entry)) for user_id, entry in state.setdefault("wallets", {}).items()
+                   if isinstance(entry, dict) and entry.get("monitoring_enabled", True)]
+    for user_id, wallet in wallets:
+        address = wallet.get("address")
+        if not is_valid_solana_address(address):
+            continue
+        LOG.info("[WALLET] Checking wallet %s", wallet_short_address(address))
+        try:
+            signatures = solana_wallet.get_wallet_signatures(address)
+            if not signatures:
+                with STATE_LOCK:
+                    current = state["wallets"].get(user_id)
+                    if current:
+                        current["last_check"] = time.time()
+                continue
+            latest_signature = signatures[0]["signature"]
+            last_signature = wallet.get("last_signature")
+            if not last_signature:
+                registered_at = float(wallet.get("registered_at") or 0)
+                new_rows = [row for row in signatures if isinstance(row.get("blockTime"), (int, float))
+                            and row["blockTime"] >= int(registered_at)] if registered_at else []
+                new_rows.reverse()
+                if not new_rows:
+                    with STATE_LOCK:
+                        current = state["wallets"].get(user_id)
+                        if current:
+                            current["last_signature"] = latest_signature
+                            current["last_check"] = time.time()
+                            save_state(state)
+                    LOG.info("[WALLET] Baseline signature saved for wallet %s", wallet_short_address(address))
+                    continue
+            else:
+                new_rows = []
+                for row in signatures:
+                    if row.get("signature") == last_signature:
+                        break
+                    new_rows.append(row)
+                new_rows.reverse()
+            # Cap per-cycle notifications so a busy wallet cannot flood Telegram.
+            for row in new_rows[:5]:
+                signature = row["signature"]
+                LOG.info("[WALLET] New transaction detected for wallet %s", wallet_short_address(address))
+                transaction = solana_wallet.get_wallet_transaction(signature)
+                if transaction is None:
+                    LOG.warning("[WALLET] Transaction not indexed yet; will retry on the next check")
+                    break
+                meta = transaction.get("meta") or {}
+                if meta.get("err") is not None:
+                    with STATE_LOCK:
+                        current = state["wallets"].get(user_id)
+                        if current:
+                            current["last_signature"] = signature
+                            current["last_check"] = time.time()
+                            save_state(state)
+                    continue
+                record = {
+                    "signature": signature,
+                    "classification": solana_wallet.classify_transaction(transaction),
+                    "timestamp": transaction.get("blockTime") or row.get("blockTime") or time.time(),
+                    "assets": solana_wallet.extract_token_changes(transaction, address),
+                }
+                LOG.info("[WALLET] Transaction classified as generic movement")
+                current = state["wallets"].get(user_id)
+                if current and current.get("alerts_enabled", True):
+                    try:
+                        send_message(token, current.get("chat_id") or user_id,
+                                     wallet_movement_text(address, record), solscan_markup(signature))
+                    except TelegramError as exc:
+                        LOG.warning("[WALLET] Could not deliver movement alert; will retry: %s", exc)
+                        break
+                    LOG.info("[WALLET] Alert sent for wallet %s", wallet_short_address(address))
+                with STATE_LOCK:
+                    current = state["wallets"].get(user_id)
+                    if current:
+                        current.setdefault("history", []).insert(0, record)
+                        current["history"] = current["history"][:20]
+                        current["last_signature"] = signature
+                        current["last_check"] = time.time()
+                        save_state(state)
+        except solana_wallet.WalletRpcError as exc:
+            LOG.warning("[WALLET] RPC error for wallet %s: %s", wallet_short_address(address), exc)
+        except TelegramError as exc:
+            LOG.warning("[WALLET] Telegram error while processing wallet %s: %s", wallet_short_address(address), exc)
+        except Exception:
+            LOG.exception("[WALLET] Unexpected error while checking wallet %s", wallet_short_address(address))
+
+
+def market_monitor(state: dict[str, Any], token: str, threshold: float, cooldown: float,
+                   wallet_interval: float = WALLET_CHECK_INTERVAL_SECONDS) -> None:
     failures = 0
+    last_wallet_check = 0.0
+    last_price_check = 0.0
     while not STOP.is_set():
         with STATE_LOCK:
-            has_watches = bool(state["watches"])
-        if not has_watches:
-            failures = 0
-            STOP.wait(PRICE_CHECK_SECONDS)
-            continue
+            has_watches = bool(state.setdefault("watches", {}))
+            has_wallets = bool(state.setdefault("wallets", {}))
         try:
-            check_prices(state, token, threshold, cooldown)
+            now = time.monotonic()
+            if has_watches and now - last_price_check >= PRICE_CHECK_SECONDS:
+                check_prices(state, token, threshold, cooldown)
+                last_price_check = now
+            if has_wallets and now - last_wallet_check >= wallet_interval:
+                check_wallets(state, token)
+                last_wallet_check = now
             failures = 0
             with STATE_LOCK:
                 save_state(state)
-            STOP.wait(PRICE_CHECK_SECONDS)
+            deadlines = []
+            if has_watches:
+                deadlines.append(PRICE_CHECK_SECONDS - (time.monotonic() - last_price_check))
+            if has_wallets:
+                deadlines.append(wallet_interval - (time.monotonic() - last_wallet_check))
+            wait_seconds = max(1, min(deadlines)) if deadlines else PRICE_CHECK_SECONDS
+            STOP.wait(wait_seconds)
         except Exception as exc:
             failures += 1
             delay = min(300, 10 * (2 ** min(failures - 1, 5)))
-            LOG.exception("Erro no ciclo de monitoramento de preços; nova tentativa em %ss: %s", delay, exc)
+            LOG.exception("Erro no ciclo de monitoramento; nova tentativa em %ss: %s", delay, exc)
             STOP.wait(delay)
 
 
@@ -1198,6 +1653,7 @@ def main() -> int:
     try:
         threshold = env_float("ALERT_THRESHOLD_PERCENT", 10, 0.1, 1000)
         cooldown = env_float("ALERT_COOLDOWN_MINUTES", 30, 1, 10080) * 60
+        wallet_interval = env_float("WALLET_CHECK_INTERVAL_SECONDS", 60, 15, 3600)
         run_seconds = env_float("RUN_FOR_SECONDS", 0, 0, 86400)
     except BotError as exc:
         LOG.error("Configuração inválida: %s", exc)
@@ -1234,8 +1690,8 @@ def main() -> int:
     if STOP.is_set():
         return 0
 
-    LOG.info("Worker contínuo iniciado; tokens monitorados: %d", len(state["watches"]))
-    monitor = threading.Thread(target=market_monitor, args=(state, token, threshold, cooldown), name="market-monitor", daemon=True)
+    LOG.info("Worker contínuo iniciado; tokens monitorados: %d; carteiras: %d", len(state["watches"]), len(state.get("wallets", {})))
+    monitor = threading.Thread(target=market_monitor, args=(state, token, threshold, cooldown, wallet_interval), name="market-monitor", daemon=True)
     monitor.start()
     failures = 0
     auth_rejected = False
