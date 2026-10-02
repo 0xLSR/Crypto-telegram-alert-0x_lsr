@@ -47,15 +47,15 @@ class TelegramApiTests(unittest.TestCase):
         self.assertNotIn(token, str(raised.exception))
         self.assertNotIn(token, "\n".join(captured.output))
 
-    def test_dexscreener_network_error_has_separate_type(self):
+    def test_geckoterminal_network_error_has_separate_type(self):
         with patch.object(
             bot.urllib.request,
             "urlopen",
-            side_effect=URLError("simulated DexScreener network failure"),
+            side_effect=URLError("simulated GeckoTerminal network failure"),
         ):
-            with self.assertRaises(bot.DexScreenerError) as raised:
-                bot.http_json("https://api.dexscreener.com/latest/dex/search?q=SOL")
-        self.assertIn("simulated DexScreener network failure", str(raised.exception))
+            with self.assertRaises(bot.MarketDataError) as raised:
+                bot.http_json("https://api.geckoterminal.com/api/v2/search/pools?query=SOL&network=solana")
+        self.assertIn("simulated GeckoTerminal network failure", str(raised.exception))
 
     def test_telegram_error_includes_code_and_description_redacted(self):
         token = "123456:abcdefghijklmnopqrstuvwxyzABCDEFGHIJK"
@@ -115,7 +115,7 @@ class TelegramApiTests(unittest.TestCase):
             "liquidity": {"usd": 100000},
             "volume": {"h24": 25000},
             "fdv": 1000000,
-            "url": "https://dexscreener.com/solana/example",
+            "url": "https://www.geckoterminal.com/solana/pools/example",
         }
         state = {"offset": 0, "watches": {}}
         sent = []
@@ -145,16 +145,95 @@ class TelegramApiTests(unittest.TestCase):
         self.assertEqual(sent[4], "Monitoramento removido.")
         self.assertEqual(state["watches"], {})
 
-    def test_price_checks_skip_dexscreener_when_no_tokens_are_watched(self):
-        with patch.object(bot, "get_pair") as get_pair:
+    def test_price_checks_skip_market_data_when_no_tokens_are_watched(self):
+        with patch.object(bot, "http_json") as request:
             bot.check_prices({"watches": {}}, "test-token", 10.0, 1800.0)
-        get_pair.assert_not_called()
+        request.assert_not_called()
 
-    def test_dexscreener_monitoring_failure_does_not_escape_price_cycle(self):
+    def test_market_data_monitoring_failure_does_not_escape_price_cycle(self):
         address = "So11111111111111111111111111111111111111112"
         state = {"watches": {address.lower(): {"address": address, "subscribers": []}}}
-        with patch.object(bot, "http_json", side_effect=bot.DexScreenerError("temporary outage")):
+        with patch.object(bot, "http_json", side_effect=bot.MarketDataError("temporary outage")):
             bot.check_prices(state, "test-token", 10.0, 1800.0)
+
+    def test_geckoterminal_address_lookup_normalizes_market_metrics(self):
+        address = "So11111111111111111111111111111111111111112"
+        response = {
+            "data": {
+                "id": "solana_token",
+                "type": "token",
+                "attributes": {
+                    "address": address,
+                    "name": "Wrapped SOL",
+                    "symbol": "SOL",
+                    "price_usd": "150",
+                    "total_reserve_in_usd": "100000",
+                    "volume_usd": {"h24": "25000"},
+                    "market_cap_usd": "1000000",
+                },
+                "relationships": {"top_pools": {"data": [{"id": "solana_pool", "type": "pool"}]}},
+            },
+            "included": [{
+                "id": "solana_pool", "type": "pool",
+                "attributes": {
+                    "address": "PoolAddress",
+                    "price_change_percentage": {"h24": "1.5"},
+                    "volume_usd": {"h24": "25000"},
+                    "reserve_in_usd": "100000",
+                },
+            }],
+        }
+        with patch.object(bot, "http_json", return_value=response) as request:
+            pair = bot.get_pair(address)
+
+        self.assertIn("/networks/solana/tokens/", request.call_args.args[0])
+        self.assertEqual(pair["baseToken"]["symbol"], "SOL")
+        self.assertEqual(pair["priceUsd"], "150")
+        self.assertEqual(pair["priceChange"]["h24"], "1.5")
+        self.assertIn("geckoterminal.com", pair["url"])
+
+    def test_geckoterminal_symbol_search_returns_matching_solana_token(self):
+        response = {
+            "data": [{
+                "id": "solana_pool", "type": "pool",
+                "attributes": {"address": "PoolAddress", "price_change_percentage": {"h24": "2.5"}, "reserve_in_usd": "200000", "volume_usd": {"h24": "50000"}},
+                "relationships": {"base_token": {"data": {"id": "solana_token"}}},
+            }],
+            "included": [{
+                "id": "solana_token", "type": "token",
+                "attributes": {"address": "So11111111111111111111111111111111111111112", "name": "Wrapped SOL", "symbol": "SOL", "price_usd": "150", "market_cap_usd": "1000000"},
+            }],
+        }
+        with patch.object(bot, "http_json", return_value=response) as request:
+            pair = bot.get_pair("SOL")
+
+        self.assertIn("/search/pools?", request.call_args.args[0])
+        self.assertEqual(pair["baseToken"]["symbol"], "SOL")
+        self.assertEqual(pair["priceUsd"], "150")
+        self.assertEqual(pair["priceChange"]["h24"], "2.5")
+
+    def test_monitor_checks_watched_tokens_through_geckoterminal_batches(self):
+        address = "So11111111111111111111111111111111111111112"
+        response = {
+            "data": [{
+                "id": "solana_token", "type": "token",
+                "attributes": {"address": address, "name": "Wrapped SOL", "symbol": "SOL", "price_usd": "120", "total_reserve_in_usd": "100000"},
+                "relationships": {"top_pools": {"data": [{"id": "solana_pool", "type": "pool"}]}},
+            }],
+            "included": [{
+                "id": "solana_pool", "type": "pool",
+                "attributes": {"address": "PoolAddress", "price_change_percentage": {"h24": "2"}, "reserve_in_usd": "100000"},
+            }],
+        }
+        state = {"watches": {address.lower(): {"address": address, "subscribers": ["1"], "anchor_price": 100, "last_alert": 0}}}
+        bot.STOP.clear()
+        with patch.object(bot, "http_json", return_value=response) as request:
+            with patch.object(bot, "send_message") as send_message:
+                bot.check_prices(state, "test-token", 10.0, 1800.0)
+
+        self.assertIn("/tokens/multi/", request.call_args.args[0])
+        self.assertIn("geckoterminal.com", send_message.call_args.args[2])
+        self.assertEqual(state["watches"][address.lower()]["anchor_price"], 120.0)
 
     def test_continuous_poll_uses_telegram_long_poll_for_low_latency(self):
         self.assertEqual(bot.TELEGRAM_POLL_TIMEOUT_SECONDS, 25)

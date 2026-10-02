@@ -1,6 +1,6 @@
 # Crypto-telegram-alert-0x_lsr
 
-Bot de alertas Telegram para tokens Solana, usando os dados públicos do [DexScreener](https://docs.dexscreener.com/api/reference). É possível iniciar o polling manualmente pelo GitHub Actions. Para execução realmente contínua sem reiniciar manualmente, use o Background Worker do Render descrito abaixo.
+Bot de alertas Telegram para tokens Solana, usando os dados públicos do [GeckoTerminal](https://api.geckoterminal.com/docs/index.html). É possível iniciar o polling manualmente pelo GitHub Actions. Para execução realmente contínua sem reiniciar manualmente, use o Background Worker do Render descrito abaixo.
 
 ## Comandos
 
@@ -9,7 +9,7 @@ Bot de alertas Telegram para tokens Solana, usando os dados públicos do [DexScr
 - `/watch <endereço Solana>` e `/unwatch <endereço>`: acompanhar/remover um token.
 - `/list`: listar os tokens acompanhados por este chat.
 
-O limiar é configurado por `ALERT_THRESHOLD_PERCENT` (padrão 10%) e o intervalo mínimo entre alertas por token por `ALERT_COOLDOWN_MINUTES` (padrão 30). A verificação de mercado ocorre a cada minuto por padrão e só chama o DexScreener quando há tokens acompanhados. Consultas de monitoramento são agrupadas em lotes de até 30 endereços. Falhas do DexScreener são registradas e tentadas novamente; não interrompem o polling do Telegram.
+O limiar é configurado por `ALERT_THRESHOLD_PERCENT` (padrão 10%) e o intervalo mínimo entre alertas por token por `ALERT_COOLDOWN_MINUTES` (padrão 30). A verificação de mercado ocorre a cada minuto por padrão e só chama o GeckoTerminal quando há tokens acompanhados. Consultas de monitoramento são agrupadas em lotes de até 30 endereços. Falhas do GeckoTerminal são registradas e tentadas novamente; não interrompem o polling do Telegram. A API pública não exige chave, mas está em beta, limita aproximadamente 10 chamadas por minuto e serve dados em cache de 1 minuto; limites podem variar.
 
 O bot chama `getMe` e remove eventual webhook sem descartar atualizações pendentes na inicialização. Ele então usa `getUpdates` com timeout Telegram de 25 segundos, o que permite respostas imediatas sem polling agressivo. Erros de rede/API aparecem nos logs com serviço, código HTTP e resposta; o token é removido dos diagnósticos.
 

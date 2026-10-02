@@ -1,4 +1,4 @@
-"""Continuous Telegram crypto alert worker backed by Telegram and DexScreener."""
+"""Continuous Telegram crypto alert worker backed by Telegram and GeckoTerminal."""
 from __future__ import annotations
 
 import json
@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any
 
 API_BASE = "https://api.telegram.org/bot{token}/{method}"
-DEX_BASE = "https://api.dexscreener.com/latest/dex"
+GECKO_BASE = "https://api.geckoterminal.com/api/v2"
 STATE_FILE = Path(os.getenv("BOT_STATE_FILE", "data/state.json"))
 TELEGRAM_POLL_TIMEOUT_SECONDS = 25
 TELEGRAM_REQUEST_TIMEOUT_SECONDS = 35
@@ -37,14 +37,17 @@ class TelegramError(BotError):
     pass
 
 
-class DexScreenerError(BotError):
+class MarketDataError(BotError):
     pass
 
 
 def service_for_url(url: str) -> tuple[str, type[BotError]]:
-    if urllib.parse.urlsplit(url).hostname == "api.telegram.org":
+    host = urllib.parse.urlsplit(url).hostname
+    if host == "api.telegram.org":
         return "Telegram", TelegramError
-    return "DexScreener", DexScreenerError
+    if host == "api.geckoterminal.com":
+        return "GeckoTerminal", MarketDataError
+    return "API externa", MarketDataError
 
 
 def redact_token(value: str, url: str) -> str:
@@ -97,8 +100,10 @@ def save_state(state: dict[str, Any]) -> None:
 def http_json(url: str, *, method: str = "GET", payload: dict[str, Any] | None = None,
               timeout: float = API_REQUEST_TIMEOUT_SECONDS) -> Any:
     body = json.dumps(payload).encode() if payload is not None else None
-    request = urllib.request.Request(url, data=body, method=method,
-        headers={"User-Agent": "crypto-telegram-alert/1.0", "Content-Type": "application/json"})
+    headers = {"User-Agent": "crypto-telegram-alert/1.0", "Content-Type": "application/json"}
+    if urllib.parse.urlsplit(url).hostname == "api.geckoterminal.com":
+        headers["Accept"] = "application/json;version=20230203"
+    request = urllib.request.Request(url, data=body, method=method, headers=headers)
     service, error_type = service_for_url(url)
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
@@ -162,20 +167,76 @@ def compact(value: Any) -> str:
         return "indisponível"
 
 
+def normalize_token(token: dict[str, Any], pools: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """Adapt GeckoTerminal token/pool resources to the bot's display format."""
+    attributes = token.get("attributes") or {}
+    if not attributes.get("address"):
+        return None
+    pool_by_id = {pool.get("id"): pool for pool in pools if pool.get("id")}
+    top_pool_ids = (((token.get("relationships") or {}).get("top_pools") or {}).get("data") or [])
+    pool = next((pool_by_id.get(item.get("id")) for item in top_pool_ids if pool_by_id.get(item.get("id"))), None)
+    if pool is None and pools:
+        pool = max(pools, key=lambda p: float((p.get("attributes") or {}).get("reserve_in_usd") or 0))
+    pool_attributes = (pool or {}).get("attributes") or {}
+    token_price = attributes.get("price_usd")
+    if token_price is None:
+        token_price = pool_attributes.get("token_price_usd") or pool_attributes.get("base_token_price_usd")
+    volume = attributes.get("volume_usd") or {}
+    volume_24h = volume.get("h24") if isinstance(volume, dict) else None
+    volume_24h = volume_24h or (pool_attributes.get("volume_usd") or {}).get("h24")
+    price_change = pool_attributes.get("price_change_percentage") or {}
+    pool_address = pool_attributes.get("address")
+    token_address = attributes["address"]
+    return {
+        "chainId": "solana",
+        "baseToken": {"address": token_address, "symbol": attributes.get("symbol"), "name": attributes.get("name")},
+        "priceUsd": token_price,
+        "priceChange": {"h24": price_change.get("h24")},
+        "liquidity": {"usd": attributes.get("total_reserve_in_usd") or pool_attributes.get("reserve_in_usd")},
+        "volume": {"h24": volume_24h},
+        "marketCap": attributes.get("market_cap_usd") or pool_attributes.get("market_cap_usd"),
+        "fdv": attributes.get("fdv_usd") or pool_attributes.get("fdv_usd"),
+        "url": f"https://www.geckoterminal.com/solana/pools/{pool_address}" if pool_address else f"https://www.geckoterminal.com/solana/tokens/{token_address}",
+    }
+
+
+def gecko_pools(result: dict[str, Any]) -> list[dict[str, Any]]:
+    included = result.get("included") or []
+    return [resource for resource in included if resource.get("type") == "pool"]
+
+
 def get_pair(query: str) -> dict[str, Any] | None:
-    encoded = urllib.parse.quote(query, safe="")
+    """Resolve a Solana token by address or symbol with GeckoTerminal public API."""
     is_address = bool(re.fullmatch(r"[1-9A-HJ-NP-Za-km-z]{32,50}", query))
-    endpoint = f"{DEX_BASE}/tokens/{encoded}" if is_address else f"{DEX_BASE}/search?q={encoded}"
-    result = http_json(endpoint, timeout=API_REQUEST_TIMEOUT_SECONDS)
-    pairs = [p for p in (result.get("pairs") or []) if p.get("chainId") == "solana"]
     if is_address:
-        matching = [p for p in pairs if (p.get("baseToken") or {}).get("address", "").lower() == query.lower()]
-        if matching:
-            pairs = matching
-    else:
-        exact = [p for p in pairs if query.lower() in {str((p.get("baseToken") or {}).get("symbol", "")).lower(), str((p.get("baseToken") or {}).get("name", "")).lower()}]
-        if exact:
-            pairs = exact
+        encoded = urllib.parse.quote(query, safe="")
+        result = http_json(f"{GECKO_BASE}/networks/solana/tokens/{encoded}?include=top_pools", timeout=API_REQUEST_TIMEOUT_SECONDS)
+        if not isinstance(result, dict):
+            raise MarketDataError("GeckoTerminal retornou uma resposta em formato inesperado.")
+        token = result.get("data") or {}
+        return normalize_token(token, gecko_pools(result))
+
+    params = urllib.parse.urlencode({"query": query, "network": "solana", "include": "base_token,quote_token"})
+    result = http_json(f"{GECKO_BASE}/search/pools?{params}", timeout=API_REQUEST_TIMEOUT_SECONDS)
+    if not isinstance(result, dict):
+        raise MarketDataError("GeckoTerminal retornou uma resposta em formato inesperado.")
+    included = result.get("included") or []
+    token_by_id = {resource.get("id"): resource for resource in included if resource.get("type") == "token"}
+    pools = [resource for resource in (result.get("data") or []) if resource.get("type") == "pool"]
+    candidates: list[tuple[dict[str, Any], list[dict[str, Any]]]] = []
+    for pool in pools:
+        relationships = pool.get("relationships") or {}
+        base_ref = ((relationships.get("base_token") or {}).get("data") or {}).get("id")
+        quote_ref = ((relationships.get("quote_token") or {}).get("data") or {}).get("id")
+        base = token_by_id.get(base_ref)
+        quote = token_by_id.get(quote_ref)
+        matching = [token for token in (base, quote) if token and query.casefold() in {
+            str((token.get("attributes") or {}).get("symbol", "")).casefold(),
+            str((token.get("attributes") or {}).get("name", "")).casefold(),
+        }]
+        for token in matching or ([base] if base else []):
+            candidates.append((token, [pool]))
+    pairs = [pair for token, token_pools in candidates if (pair := normalize_token(token, token_pools))]
     return max(pairs, key=lambda p: float((p.get("liquidity") or {}).get("usd") or 0), default=None)
 
 
@@ -187,7 +248,7 @@ def pair_summary(pair: dict[str, Any]) -> str:
     return (f"{base.get('symbol') or base.get('name') or 'Token'} (Solana)\n"
         f"Preço: {money(pair.get('priceUsd'))}\nVariação 24h: {change_text}\n"
         f"Liquidez: {compact((pair.get('liquidity') or {}).get('usd'))} · Volume 24h: {compact((pair.get('volume') or {}).get('h24'))}\n"
-        f"Market cap/FDV: {compact(cap)}\nEndereço: {base.get('address', 'indisponível')}\nFonte: DexScreener — {pair.get('url', '')}")
+        f"Market cap/FDV: {compact(cap)}\nEndereço: {base.get('address', 'indisponível')}\nFonte: GeckoTerminal — {pair.get('url', '')}")
 
 
 def help_text() -> str:
@@ -222,14 +283,14 @@ def handle_update(update: dict[str, Any], state: dict[str, Any], token: str, thr
                     send_message(token, chat_id, "Uso: /price <TOKEN ou endereço>")
                 else:
                     pair = get_pair(arg)
-                    send_message(token, chat_id, pair_summary(pair) if pair else "Token Solana não encontrado no DexScreener.")
+                    send_message(token, chat_id, pair_summary(pair) if pair else "Token Solana não encontrado no GeckoTerminal.")
             elif command == "/watch":
                 if not re.fullmatch(r"[1-9A-HJ-NP-Za-km-z]{32,50}", arg):
                     send_message(token, chat_id, "Informe um endereço Solana válido: /watch <endereço>")
                     return
                 pair = get_pair(arg)
                 if not pair:
-                    send_message(token, chat_id, "Não encontrei um par Solana para esse endereço.")
+                    send_message(token, chat_id, "Não encontrei um par Solana para esse endereço no GeckoTerminal.")
                     return
                 address = pair["baseToken"]["address"]
                 key = address.lower()
@@ -254,9 +315,9 @@ def handle_update(update: dict[str, Any], state: dict[str, Any], token: str, thr
                 send_message(token, chat_id, "Seus tokens monitorados:\n" + ("\n".join(f"• {e['address']}" for e in entries) if entries else "nenhum"))
         except TelegramError:
             raise
-        except DexScreenerError as exc:
-            LOG.warning("DexScreener indisponível ao processar %s: %s", command, exc)
-            send_message(token, chat_id, "DexScreener está temporariamente indisponível. Tente novamente em instantes.")
+        except MarketDataError as exc:
+            LOG.warning("GeckoTerminal indisponível ao processar %s: %s", command, exc)
+            send_message(token, chat_id, "GeckoTerminal está temporariamente indisponível. Tente novamente em instantes.")
         except (BotError, KeyError, TypeError, ValueError) as exc:
             LOG.warning("Falha ao processar %s: %s", command, exc)
             send_message(token, chat_id, "Não consegui concluir o comando agora. Tente novamente mais tarde.")
@@ -271,13 +332,16 @@ def check_prices(state: dict[str, Any], token: str, threshold: float, cooldown: 
         batch = addresses[start:start + 30]
         try:
             joined = ",".join(address for _, address in batch)
-            result = http_json(f"https://api.dexscreener.com/tokens/v1/solana/{urllib.parse.quote(joined, safe=',')}", timeout=API_REQUEST_TIMEOUT_SECONDS)
-            pairs = result if isinstance(result, list) else []
+            endpoint = f"{GECKO_BASE}/networks/solana/tokens/multi/{urllib.parse.quote(joined, safe=',')}?include=top_pools"
+            result = http_json(endpoint, timeout=API_REQUEST_TIMEOUT_SECONDS)
+            if not isinstance(result, dict):
+                raise MarketDataError("GeckoTerminal retornou uma resposta em formato inesperado.")
+            pools = gecko_pools(result)
             by_address: dict[str, dict[str, Any]] = {}
-            for pair in pairs:
-                address = (pair.get("baseToken") or {}).get("address", "").lower()
-                if address in {key for key, _ in batch} and (address not in by_address or float((pair.get("liquidity") or {}).get("usd") or 0) > float((by_address[address].get("liquidity") or {}).get("usd") or 0)):
-                    by_address[address] = pair
+            for token_resource in result.get("data") or []:
+                pair = normalize_token(token_resource, pools)
+                if pair:
+                    by_address[pair["baseToken"]["address"].lower()] = pair
             for key, _ in batch:
                 pair = by_address.get(key)
                 if not pair or not pair.get("priceUsd"):
@@ -310,8 +374,8 @@ def check_prices(state: dict[str, Any], token: str, threshold: float, cooldown: 
                         if entry is not None:
                             entry["anchor_price"] = price
                             entry["last_alert"] = now
-        except DexScreenerError as exc:
-            LOG.warning("DexScreener falhou no monitoramento; o bot continua ativo: %s", exc)
+        except MarketDataError as exc:
+            LOG.warning("GeckoTerminal falhou no monitoramento; o bot continua ativo: %s", exc)
 
 
 def market_monitor(state: dict[str, Any], token: str, threshold: float, cooldown: float) -> None:
@@ -373,7 +437,7 @@ def main() -> int:
         return 0
 
     LOG.info("Worker contínuo iniciado; tokens monitorados: %d", len(state["watches"]))
-    monitor = threading.Thread(target=market_monitor, args=(state, token, threshold, cooldown), name="dexscreener-monitor", daemon=True)
+    monitor = threading.Thread(target=market_monitor, args=(state, token, threshold, cooldown), name="geckoterminal-monitor", daemon=True)
     monitor.start()
     failures = 0
     deadline = time.monotonic() + run_seconds if run_seconds else None
