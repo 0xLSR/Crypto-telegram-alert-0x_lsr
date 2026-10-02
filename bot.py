@@ -19,14 +19,43 @@ from typing import Any
 API_BASE = "https://api.telegram.org/bot{token}/{method}"
 DEX_BASE = "https://api.dexscreener.com/latest/dex"
 STATE_FILE = Path(os.getenv("BOT_STATE_FILE", "data/state.json"))
-POLL_SECONDS = 15
+POLL_SECONDS = 3
 PRICE_CHECK_SECONDS = 60
+TELEGRAM_POLL_TIMEOUT_SECONDS = 1
+TELEGRAM_REQUEST_TIMEOUT_SECONDS = 6
+API_REQUEST_TIMEOUT_SECONDS = 15
 MAX_WATCHES = 100
 LOG = logging.getLogger("crypto_alert_bot")
 
 
 class BotError(Exception):
     pass
+
+
+class TelegramError(BotError):
+    """Telegram API or transport error; safe to include in logs."""
+
+
+class DexScreenerError(BotError):
+    """DexScreener API or transport error; safe to include in logs."""
+
+
+def service_for_url(url: str) -> tuple[str, type[BotError]]:
+    host = urllib.parse.urlsplit(url).hostname or ""
+    if host == "api.telegram.org":
+        return "Telegram", TelegramError
+    return "DexScreener", DexScreenerError
+
+
+def redact_token(value: str, url: str) -> str:
+    """Redact the bot token from diagnostics without logging request URLs."""
+    path = urllib.parse.urlsplit(url).path
+    token_match = re.search(r"/bot([^/]+)/", path)
+    if token_match:
+        token = token_match.group(1)
+        for token_form in {token, urllib.parse.quote(token, safe=""), urllib.parse.quote(token, safe="").lower()}:
+            value = value.replace(token_form, "[REDACTED]")
+    return value
 
 
 def env_float(name: str, default: float, minimum: float, maximum: float) -> float:
@@ -68,36 +97,48 @@ def save_state(state: dict[str, Any]) -> None:
             os.unlink(temp_name)
 
 
-def http_json(url: str, *, method: str = "GET", payload: dict[str, Any] | None = None) -> Any:
+def http_json(
+    url: str,
+    *,
+    method: str = "GET",
+    payload: dict[str, Any] | None = None,
+    timeout: float = API_REQUEST_TIMEOUT_SECONDS,
+) -> Any:
     body = json.dumps(payload).encode() if payload is not None else None
     request = urllib.request.Request(url, data=body, method=method, headers={"User-Agent": "crypto-telegram-alert/1.0", "Content-Type": "application/json"})
+    service, error_type = service_for_url(url)
     try:
-        with urllib.request.urlopen(request, timeout=25) as response:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
             result = json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         response_body = exc.read().decode("utf-8", errors="replace")
-        # Telegram embeds the bot token in the request path. Never log the URL,
-        # and redact the token in case an upstream error body echoes the URL.
-        path = urllib.parse.urlsplit(url).path
-        token_match = re.search(r"/bot([^/]+)/", path)
-        if token_match:
-            token = token_match.group(1)
-            response_body = response_body.replace(token, "[REDACTED]")
-            response_body = response_body.replace(f"bot{token}", "bot[REDACTED]")
-        LOG.error("Erro HTTP %s; corpo da resposta: %s", exc.code, response_body[:4000])
-        raise BotError(f"Falha HTTP {exc.code} na API externa.") from exc
-    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
-        raise BotError("Falha na comunicação com a API externa.") from exc
+        response_body = redact_token(response_body, url)
+        LOG.error("%s respondeu HTTP %s; corpo da resposta: %s", service, exc.code, response_body[:4000])
+        raise error_type(f"{service} respondeu HTTP {exc.code}: {response_body[:1000]}") from exc
+    except urllib.error.URLError as exc:
+        reason = exc.reason
+        detail = redact_token(f"{type(reason).__name__}: {reason}", url)
+        LOG.error("Erro de rede ao acessar %s: %s", service, detail)
+        raise error_type(f"Erro de rede no {service}: {detail}") from exc
+    except (TimeoutError, OSError) as exc:
+        detail = redact_token(f"{type(exc).__name__}: {exc}", url)
+        LOG.error("Erro de rede ao acessar %s: %s", service, detail)
+        raise error_type(f"Erro de rede no {service}: {detail}") from exc
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        LOG.error("Resposta JSON inválida recebida de %s: %s", service, exc)
+        raise error_type(f"Resposta JSON inválida recebida de {service}.") from exc
     return result
 
 
 def telegram(token: str, method: str, payload: dict[str, Any] | None = None) -> Any:
-    result = http_json(API_BASE.format(token=token, method=method), method="POST", payload=payload or {})
+    url = API_BASE.format(token=token, method=method)
+    result = http_json(url, method="POST", payload=payload or {}, timeout=TELEGRAM_REQUEST_TIMEOUT_SECONDS)
+    if not isinstance(result, dict):
+        raise TelegramError(f"Telegram retornou uma resposta inválida para {method}.")
     if not result.get("ok"):
         error_code = result.get("error_code", "desconhecido")
-        description = str(result.get("description") or "sem descrição")
-        description = description.replace(token, "[REDACTED]")
-        raise BotError(f"Telegram API {error_code}: {description}")
+        description = redact_token(str(result.get("description") or "sem descrição"), url)
+        raise TelegramError(f"Telegram API {error_code}: {description}")
     return result.get("result")
 
 
@@ -140,7 +181,7 @@ def compact(value: Any) -> str:
 def get_pair(query: str) -> dict[str, Any] | None:
     encoded = urllib.parse.quote(query, safe="")
     endpoint = f"{DEX_BASE}/tokens/{encoded}" if re.fullmatch(r"[1-9A-HJ-NP-Za-km-z]{32,50}", query) else f"{DEX_BASE}/search?q={encoded}"
-    result = http_json(endpoint)
+    result = http_json(endpoint, timeout=API_REQUEST_TIMEOUT_SECONDS)
     pairs = [pair for pair in (result.get("pairs") or []) if pair.get("chainId") == "solana"]
     if not pairs:
         return None
@@ -234,12 +275,19 @@ def handle_update(update: dict[str, Any], state: dict[str, Any], token: str, thr
         elif command == "/list":
             entries = [entry for entry in watches.values() if str(chat_id) in entry["subscribers"]]
             send_message(token, chat_id, "Seus tokens monitorados:\n" + ("\n".join(f"• {e['address']}" for e in entries) if entries else "nenhum"))
+    except TelegramError:
+        raise
+    except DexScreenerError as exc:
+        LOG.warning("Falha temporária do DexScreener ao processar comando: %s", exc)
+        send_message(token, chat_id, "DexScreener está temporariamente indisponível. Tente novamente em instantes.")
     except BotError as exc:
         LOG.warning("Falha ao processar comando: %s", exc)
         send_message(token, chat_id, "Não consegui concluir o comando agora. Tente novamente mais tarde.")
 
 
 def check_prices(state: dict[str, Any], token: str, threshold: float, cooldown: float) -> None:
+    if not state["watches"]:
+        return
     now = time.time()
     for key, entry in list(state["watches"].items()):
         try:
@@ -257,12 +305,14 @@ def check_prices(state: dict[str, Any], token: str, threshold: float, cooldown: 
                 for chat_id in entry.get("subscribers", []):
                     try:
                         send_message(token, chat_id, text)
-                    except BotError:
-                        LOG.warning("Não foi possível entregar um alerta para um chat.")
+                    except TelegramError as exc:
+                        LOG.warning("Falha do Telegram ao entregar alerta: %s", exc)
                 entry["anchor_price"] = price
                 entry["last_alert"] = now
-        except (BotError, TypeError, ValueError) as exc:
-            LOG.warning("Falha ao consultar um token monitorado: %s", exc)
+        except DexScreenerError as exc:
+            LOG.warning("Falha temporária do DexScreener ao consultar token monitorado: %s", exc)
+        except (TypeError, ValueError) as exc:
+            LOG.warning("Resposta inválida para um token monitorado: %s", exc)
         time.sleep(0.25)
 
 
@@ -300,17 +350,20 @@ def main() -> int:
     LOG.info("Bot iniciado; tokens monitorados: %d", len(state["watches"]))
     while running and (deadline is None or time.monotonic() < deadline):
         try:
-            updates = telegram(token, "getUpdates", {"offset": int(state["offset"]), "timeout": 10, "allowed_updates": ["message"]})
+            updates = telegram(token, "getUpdates", {"offset": int(state["offset"]), "timeout": TELEGRAM_POLL_TIMEOUT_SECONDS, "allowed_updates": ["message"]})
             for update in updates:
                 handle_update(update, state, token, threshold, allowed_ids)
                 state["offset"] = update["update_id"] + 1
                 save_state(state)
-            if time.monotonic() >= next_price_check:
+            if state["watches"] and time.monotonic() >= next_price_check:
                 check_prices(state, token, threshold, cooldown)
                 save_state(state)
                 next_price_check = time.monotonic() + PRICE_CHECK_SECONDS
+        except TelegramError as exc:
+            LOG.warning("Falha temporária no polling do Telegram: %s", exc)
+            time.sleep(POLL_SECONDS)
         except BotError as exc:
-            LOG.warning("Falha temporária de comunicação: %s", exc)
+            LOG.warning("Falha temporária do bot: %s", exc)
             time.sleep(POLL_SECONDS)
     save_state(state)
     LOG.info("Bot encerrado; estado salvo.")
