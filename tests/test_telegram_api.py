@@ -97,9 +97,11 @@ class MarketDataTests(unittest.TestCase):
         self.assertEqual(bot.compact(12400), "$12.4K")
         self.assertEqual(bot.compact(1250000), "$1.25M")
         self.assertEqual(bot.compact(1250000000), "$1.25B")
-        self.assertEqual(bot.percent(12.45), "🟢 +12.45%")
-        self.assertEqual(bot.percent(-12.45), "🔴 -12.45%")
+        self.assertEqual(bot.percent(12.45), "🟢🤑 +12.45%")
+        self.assertEqual(bot.percent(-12.45), "🔴🫠 -12.45%")
         self.assertEqual(bot.percent(0.001), "⚪ 0.00%")
+        self.assertEqual(bot.change_icon(12.45), "💰")
+        self.assertEqual(bot.change_icon(-12.45), "💰")
 
     def test_fdv_is_labelled_when_market_cap_is_missing(self):
         pair = dict(DEX_PAIR, marketCap=None)
@@ -241,8 +243,23 @@ class TelegramCommandTests(unittest.TestCase):
         request.assert_called_with([ADDRESS])
         fallback.assert_not_called()
         send.assert_called_once()
+        self.assertIn("🚨 Alerta de preço: 💰 +20.00% desde o último alerta", send.call_args.args[2])
+        self.assertIn("🟢🤑 Wrapped SOL", send.call_args.args[2])
         self.assertEqual(state["watches"][ADDRESS]["last_price"], 140.0)
         self.assertEqual(state["watches"][ADDRESS]["anchor_price"], 120.0)
+
+    def test_alert_visual_uses_directional_emoji_pair_for_positive_and_negative_moves(self):
+        for price, header, direction in ((110.48, "+10.48%", "🟢🤑"), (89.52, "-10.48%", "🔴🫠")):
+            with self.subTest(price=price):
+                pair = dict(DEX_PAIR, priceUsd=str(price))
+                state = {"watches": {ADDRESS: {"address": ADDRESS, "subscribers": ["11"], "anchor_price": 100, "last_alert": 0}}}
+                bot.STOP.clear()
+                with patch.object(bot, "get_gecko_pairs", return_value={ADDRESS: pair}):
+                    with patch.object(bot, "send_message") as send:
+                        bot.check_prices(state, TOKEN, 10, 1800)
+                alert = send.call_args.args[2]
+                self.assertIn(f"🚨 Alerta de preço: 💰 {header} desde o último alerta", alert)
+                self.assertIn(f"\n\n━━━━━━━━━━━━━━━━━━━━\n\n{direction} Wrapped SOL", alert)
 
     def test_periodic_monitor_falls_back_to_dex_after_gecko_failure(self):
         state = {"watches": {ADDRESS: {"address": ADDRESS, "subscribers": [], "anchor_price": 100, "last_alert": 0}}}

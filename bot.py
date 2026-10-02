@@ -324,7 +324,28 @@ def percent(value: Any) -> str:
         return "indisponível"
     if abs(number) < Decimal("0.005"):
         return "⚪ 0.00%"
-    return f"{'🟢' if number > 0 else '🔴'} {number:+.2f}%"
+    icon = "🟢🤑" if number > 0 else "🔴🫠"
+    return f"{icon} {number:+.2f}%"
+
+
+def movement_icon(value: Any) -> str:
+    try:
+        number = Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError):
+        return "⚪"
+    if not number.is_finite() or number == 0:
+        return "⚪"
+    return "🟢🤑" if number > 0 else "🔴🫠"
+
+
+def signed_percent(value: Any) -> str:
+    try:
+        number = Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError):
+        return "indisponível"
+    if not number.is_finite():
+        return "indisponível"
+    return f"{number:+.2f}%"
 
 
 def pair_liquidity(pair: dict[str, Any]) -> float:
@@ -481,7 +502,7 @@ def get_market_data(query: str) -> dict[str, Any] | None:
     return None
 
 
-def pair_summary(pair: dict[str, Any]) -> str:
+def pair_summary(pair: dict[str, Any], alert_change: Any | None = None) -> str:
     base = pair.get("baseToken") or {}
     change = (pair.get("priceChange") or {}).get("h24")
     change_text = percent(change)
@@ -491,8 +512,10 @@ def pair_summary(pair: dict[str, Any]) -> str:
     cap_value = market_cap if market_cap is not None else fdv
     name = base.get("name") or base.get("symbol") or "Token Solana"
     symbol = base.get("symbol")
-    title = f"{change_icon(change)} {name}" + (f"\n${symbol}" if symbol and symbol.casefold() != str(name).casefold() else "")
-    result = (f"{title}\n\n━━━━━━━━━━━━━━━━━━━━\n\n"
+    icon = movement_icon(alert_change) if alert_change is not None else "💰"
+    title = f"{icon} {name}" + (f"\n${symbol}" if symbol and symbol.casefold() != str(name).casefold() else "")
+    heading = f"━━━━━━━━━━━━━━━━━━━━\n\n{title}\n\n━━━━━━━━━━━━━━━━━━━━\n\n" if alert_change is not None else f"{title}\n\n━━━━━━━━━━━━━━━━━━━━\n\n"
+    result = (f"{heading}"
         f"💰 Preço\n{money(pair.get('priceUsd'))}\n\n"
         f"📈 Variação 24h\n{change_text}\n\n"
         f"{cap_label}\n{compact(cap_value)}")
@@ -633,8 +656,7 @@ def start_text() -> str:
 
 
 def change_icon(value: Any) -> str:
-    text = percent(value)
-    return text.split(" ", 1)[0] if text.startswith(("🟢", "🔴", "⚪")) else "⚪"
+    return "💰"
 
 
 def watch_list_text(entries: list[dict[str, Any]], threshold: float, page: int = 0) -> str:
@@ -751,7 +773,7 @@ def preview_add_flow(state: dict[str, Any], token: str, chat_id: int | str, addr
         save_state(state)
     markup = {"inline_keyboard": [[button("✅ Adicionar", f"add_yes:{token_callback_id(address)}"), button("❌ Cancelar", "cancel_add")],
                                    [button("◀️ Voltar", "menu")]]}
-    send_message(token, chat_id, "🟢 TOKEN ENCONTRADO\n\n" + pair_summary(pair), markup)
+    send_message(token, chat_id, "✅ TOKEN ENCONTRADO\n\n" + pair_summary(pair), markup)
 
 
 def send_watch_list(token: str, chat_id: int | str, state: dict[str, Any], threshold: float) -> None:
@@ -1117,7 +1139,7 @@ def check_prices(state: dict[str, Any], token: str, threshold: float, cooldown: 
                     if abs(change) < threshold or now - float(entry.get("last_alert", 0)) < cooldown:
                         continue
                     subscribers = list(entry.get("subscribers", []))
-                text = f"🚨 Alerta de preço: {percent(change)} desde o último alerta\n" + pair_summary(pair)
+                text = f"🚨 Alerta de preço: 💰 {signed_percent(change)} desde o último alerta\n\n" + pair_summary(pair, alert_change=change)
                 delivered = False
                 for chat_id in subscribers:
                     try:
