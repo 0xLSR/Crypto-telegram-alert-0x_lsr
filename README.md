@@ -1,6 +1,6 @@
 # Crypto-telegram-alert-0x_lsr
 
-Bot de alertas Telegram para tokens Solana, usando os dados públicos do [DexScreener](https://docs.dexscreener.com/api/reference). O GitHub Actions inicia o polling automaticamente a cada seis horas e também permite execução manual. Para execução realmente contínua sem reiniciar manualmente, use o Background Worker do Render descrito abaixo.
+Bot de alertas Telegram para tokens Solana, usando primeiro a API pública do [GeckoTerminal](https://api.geckoterminal.com/docs/index.html) e [DexScreener](https://docs.dexscreener.com/api/reference) como fallback. O GitHub Actions inicia o polling automaticamente a cada seis horas e também permite execução manual. Para execução realmente contínua sem reiniciar manualmente, use o Background Worker do Render descrito abaixo.
 
 ## Comandos
 
@@ -10,9 +10,9 @@ Bot de alertas Telegram para tokens Solana, usando os dados públicos do [DexScr
 - `/list` (`/lista`): listar somente os tokens acompanhados por este chat, com preço salvo e limiar de alerta.
 - `/preço <endereço>`: alias de `/price`.
 
-O limiar é configurado por `ALERT_THRESHOLD_PERCENT` (padrão 10%) e o intervalo mínimo entre alertas por token por `ALERT_COOLDOWN_MINUTES` (padrão 30). A verificação de mercado ocorre a cada minuto por padrão e só chama o DexScreener quando há tokens acompanhados. Falhas do DexScreener são registradas e tentadas novamente por token; não interrompem o polling do Telegram. Endereços são validados como chaves públicas Solana Base58 de 32 bytes.
+O limiar é configurado por `ALERT_THRESHOLD_PERCENT` (padrão 10%) e o intervalo mínimo entre alertas por token por `ALERT_COOLDOWN_MINUTES` (padrão 30). A verificação de mercado ocorre a cada minuto por padrão e só consulta as APIs quando há tokens acompanhados. A API de token do GeckoTerminal inclui os pools principais; a variação de 24h é lida do pool com maior liquidez. Se a consulta falhar, o bot tenta DexScreener. A indisponibilidade das duas fontes não interrompe o polling do Telegram. Endereços são validados como chaves públicas Solana Base58 de 32 bytes.
 
-O bot chama `getMe` e remove eventual webhook sem descartar atualizações pendentes na inicialização. Ele então usa `getUpdates` com timeout Telegram de 1 segundo. A primeira consulta de cada execução começa em offset 0 para receber pendências mesmo se o offset do cache estiver inválido; atualizações são confirmadas e salvas individualmente após o processamento. Erros de rede/API aparecem nos logs com serviço, código HTTP e resposta; o token é removido dos diagnósticos.
+O bot valida com segurança o formato de `TELEGRAM_BOT_TOKEN`, chama `getMe` e remove eventual webhook sem descartar atualizações pendentes na inicialização. Token rejeitado com HTTP 401 encerra o processo com erro claro, sem repetir o retry indefinidamente nem registrar o segredo. Ele então usa `getUpdates` com timeout Telegram de 1 segundo. A primeira consulta de cada execução começa em offset 0 para receber pendências mesmo se o offset do cache estiver inválido; atualizações são confirmadas e salvas individualmente após o processamento. Erros de rede/API aparecem nos logs com serviço, código HTTP e resposta; o token é removido dos diagnósticos.
 
 ## Execução manual pelo GitHub Actions
 
@@ -46,7 +46,7 @@ O plano de worker e o disco persistente são pagos. Consulte [preços atuais do 
 | `PRICE_CHECK_SECONDS` | variável opcional | `60` | Intervalo de monitoramento de preços, mínimo 15 s. |
 | `LOG_LEVEL` | variável opcional | `INFO` | Nível dos logs. |
 
-**Atenção ao erro `Telegram API 401: Unauthorized`:** esse resultado de `getMe` significa que o token atualmente configurado no serviço é inválido, foi revogado ou foi copiado incorretamente. O token não pode ser corrigido por uma alteração no código. Gere/consulte um token ativo no BotFather e substitua o valor diretamente em **Render → serviço → Environment → `TELEGRAM_BOT_TOKEN`**, sem compartilhá-lo. O valor existente de `TELEGRAM_BOT_TOKEN` no GitHub não é copiado automaticamente para o Render (secrets são write-only) e o bot só responderá depois que a autenticação passar. O bot nunca registra o token.
+**Atenção ao erro `Telegram API 401: Unauthorized`:** o Telegram rejeitou o token efetivamente enviado pelo processo. O código não consegue consultar nem corrigir o conteúdo de um Secret write-only. Para o GitHub Actions, confira em **Settings → Secrets and variables → Actions → `TELEGRAM_BOT_TOKEN`** se o valor ainda é o token ativo do `@BotFather`; substitua-o ali caso tenha sido revogado ou copiado incorretamente. Para o Render, configure o valor separadamente em **Render → serviço → Environment**. Nunca cole o token em issues, commits ou logs. Um 401 encerra a execução com erro claro em vez de manter o bot aparentemente ativo.
 
 ## Desenvolvimento local
 
