@@ -2,15 +2,16 @@
 
 Bot de alertas Telegram para tokens Solana, usando primeiro a API pública do [GeckoTerminal](https://api.geckoterminal.com/docs/index.html) e [DexScreener](https://docs.dexscreener.com/api/reference) como fallback. O GitHub Actions inicia o polling automaticamente a cada seis horas e também permite execução manual. Para execução realmente contínua sem reiniciar manualmente, use o Background Worker do Render descrito abaixo.
 
-## Comandos
+## Comandos e menus interativos
 
 - `/start` e `/help`: instruções.
-- `/price SOL`, `/price <endereço>` ou apenas `<endereço>`: nome/símbolo, preço, variação em 24h, liquidez, volume e market cap/FDV quando disponíveis.
-- `/watch <endereço Solana>` (`/add`) e `/unwatch <endereço>` (`/remove`): acompanhar/remover um token.
-- `/list` (`/lista`): listar somente os tokens acompanhados por este chat, com preço salvo e limiar de alerta.
-- `/preço <endereço>`: alias de `/price`.
+- `/start`: menu principal com botões inline para preço, alertas, adicionar token, lista e ajuda.
+- `/price` (`/preço`, `/preco`): abre o seletor inline dos tokens monitorados neste chat. `/price <endereço>` e um endereço enviado sozinho consultam diretamente.
+- `/watch <endereço>` (`/monitorar`, `/adicionar`): monitora imediatamente. Sem endereço, inicia o fluxo guiado com confirmação.
+- `/unwatch <endereço>` (`/remover`): remove diretamente. Sem endereço, abre o seletor de remoção com confirmação.
+- `/list` (`/lista`): lista os tokens deste chat e oferece botões para ver preços, adicionar ou remover.
 
-O limiar é configurado por `ALERT_THRESHOLD_PERCENT` (padrão 10%) e o intervalo mínimo entre alertas por token por `ALERT_COOLDOWN_MINUTES` (padrão 30). A verificação de mercado ocorre a cada minuto por padrão e só consulta as APIs quando há tokens acompanhados. A API de token do GeckoTerminal inclui os pools principais; a variação de 24h é lida do pool com maior liquidez. Se a consulta falhar, o bot tenta DexScreener. A indisponibilidade das duas fontes não interrompe o polling do Telegram. Endereços são validados como chaves públicas Solana Base58 de 32 bytes.
+O limiar é configurado por `ALERT_THRESHOLD_PERCENT` (padrão 10%) e o intervalo mínimo entre alertas por token por `ALERT_COOLDOWN_MINUTES` (padrão 30). A verificação de mercado ocorre a cada minuto por padrão e só consulta as APIs quando há tokens acompanhados. A API de token do GeckoTerminal inclui os pools principais; o monitor consulta em lotes de até 30 endereços. A variação de 24h é lida do pool com maior liquidez. Se a consulta falhar, o bot tenta DexScreener. A indisponibilidade das duas fontes não interrompe o polling do Telegram. Endereços são validados como chaves públicas Solana Base58 de 32 bytes.
 
 O bot valida com segurança o formato de `TELEGRAM_BOT_TOKEN`, chama `getMe` e remove eventual webhook sem descartar atualizações pendentes na inicialização. Token rejeitado com HTTP 401 encerra o processo com erro claro, sem repetir o retry indefinidamente nem registrar o segredo. Ele então usa `getUpdates` com timeout Telegram de 1 segundo. A primeira consulta de cada execução começa em offset 0 para receber pendências mesmo se o offset do cache estiver inválido; atualizações são confirmadas e salvas individualmente após o processamento. Erros de rede/API aparecem nos logs com serviço, código HTTP e resposta; o token é removido dos diagnósticos.
 

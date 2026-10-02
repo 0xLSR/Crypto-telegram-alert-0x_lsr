@@ -71,9 +71,33 @@ class AddressAndParserTests(unittest.TestCase):
             self.assertFalse(bot.is_valid_solana_address(invalid))
         self.assertEqual(bot.parse_message(ADDRESS), ("/price", ADDRESS))
         self.assertEqual(bot.parse_message("/price " + ADDRESS), ("/price", ADDRESS))
+        self.assertEqual(bot.parse_message("/preco " + ADDRESS), ("/price", ADDRESS))
+        self.assertEqual(bot.parse_message("/monitorar " + ADDRESS), ("/watch", ADDRESS))
+        self.assertEqual(bot.parse_message("/adicionar " + ADDRESS), ("/watch", ADDRESS))
+        self.assertEqual(bot.parse_message("/remover " + ADDRESS), ("/unwatch", ADDRESS))
+        self.assertEqual(bot.parse_message("/lista"), ("/list", ""))
 
 
 class MarketDataTests(unittest.TestCase):
+    def test_professional_number_formatting_and_percent_icons(self):
+        self.assertEqual(bot.money("1.25"), "$1.25")
+        self.assertEqual(bot.money("0.001254"), "$0.001254")
+        self.assertEqual(bot.money("0.00000123"), "$0.00000123")
+        self.assertEqual(bot.money("1.23e-24"), "$0.00000000000000000000000123")
+        self.assertEqual(bot.compact(950), "$950")
+        self.assertEqual(bot.compact(12400), "$12.4K")
+        self.assertEqual(bot.compact(1250000), "$1.25M")
+        self.assertEqual(bot.compact(1250000000), "$1.25B")
+        self.assertEqual(bot.percent(12.45), "🟢 +12.45%")
+        self.assertEqual(bot.percent(-12.45), "🔴 -12.45%")
+        self.assertEqual(bot.percent(0.001), "⚪ 0.00%")
+
+    def test_fdv_is_labelled_when_market_cap_is_missing(self):
+        pair = dict(DEX_PAIR, marketCap=None)
+        summary = bot.pair_summary(pair)
+        self.assertIn("💎 FDV", summary)
+        self.assertNotIn("💎 Market Cap", summary)
+
     def test_geckoterminal_documented_endpoint_and_response_shape(self):
         with patch.object(bot, "http_json", return_value=GECKO_RESPONSE) as request:
             pair = bot.get_gecko_pair(ADDRESS)
@@ -91,7 +115,7 @@ class MarketDataTests(unittest.TestCase):
         gecko.assert_called_once_with(ADDRESS)
         dex.assert_not_called()
         summary = bot.pair_summary(pair)
-        for expected in ("Wrapped SOL", "SOL", "$150.25", "+1.50%", "$100,000", "$25,000", "$900,000", ADDRESS, "geckoterminal.com"):
+        for expected in ("Wrapped SOL", "SOL", "$150.25", "+1.50%", "$100K", "$25K", "$900K", "$1M", ADDRESS, "SOLANA"):
             self.assertIn(expected, summary)
 
     def test_gecko_failure_falls_back_to_dexscreener(self):
@@ -109,7 +133,7 @@ class MarketDataTests(unittest.TestCase):
     def test_gecko_unavailable_user_gets_requested_friendly_message(self):
         state, sent = {"watches": {}}, []
         with patch.object(bot, "get_market_data", side_effect=bot.MarketDataError("offline")):
-            with patch.object(bot, "send_message", side_effect=lambda _token, _chat, text: sent.append(text)):
+            with patch.object(bot, "send_message", side_effect=lambda *args, **kwargs: sent.append(args[2])):
                 bot.handle_update({"message": {"chat": {"id": 1}, "from": {"id": 1}, "text": "/price " + ADDRESS}}, state, TOKEN, 10, set())
         self.assertEqual(sent, ["Não consegui consultar o preço agora. As fontes de mercado estão temporariamente indisponíveis. Tente novamente em alguns segundos."])
 
@@ -118,15 +142,19 @@ class TelegramCommandTests(unittest.TestCase):
     def update(self, text, chat=11, user=22):
         return {"message": {"chat": {"id": chat}, "from": {"id": user}, "text": text}}
 
+    def callback(self, data, chat=11, user=22, callback_id="cb-1"):
+        return {"callback_query": {"id": callback_id, "from": {"id": user}, "data": data,
+                                   "message": {"message_id": 99, "chat": {"id": chat}}}}
+
     def test_start_help_price_by_address_and_bare_address(self):
         sent, state = [], {"watches": {}}
         with patch.object(bot, "get_market_data", return_value=DEX_PAIR) as market:
-            with patch.object(bot, "send_message", side_effect=lambda _token, _chat, text: sent.append(text)):
+            with patch.object(bot, "send_message", side_effect=lambda *args, **kwargs: sent.append(args[2])):
                 bot.handle_update(self.update("/start"), state, TOKEN, 10, set())
                 bot.handle_update(self.update("/help"), state, TOKEN, 10, set())
                 bot.handle_update(self.update("/price " + ADDRESS), state, TOKEN, 10, set())
                 bot.handle_update(self.update(ADDRESS), state, TOKEN, 10, set())
-        self.assertIn("Bot de alertas", sent[0])
+        self.assertIn("0x_LSR CRYPTO ALERTS", sent[0])
         self.assertIn("/price", sent[1])
         self.assertIn("SOL", sent[2])
         self.assertIn("SOL", sent[3])
@@ -137,16 +165,16 @@ class TelegramCommandTests(unittest.TestCase):
         sent = []
         with patch.object(bot, "get_market_data", return_value=DEX_PAIR):
             with patch.object(bot, "save_state") as save:
-                with patch.object(bot, "send_message", side_effect=lambda _token, _chat, text: sent.append(text)):
+                with patch.object(bot, "send_message", side_effect=lambda *args, **kwargs: sent.append(args[2])):
                     bot.handle_update(self.update("/watch " + ADDRESS), state, TOKEN, 8, set())
                     bot.handle_update(self.update("/list"), state, TOKEN, 8, set())
                     bot.handle_update(self.update("/list", chat=99), state, TOKEN, 8, set())
                     bot.handle_update(self.update("/unwatch " + ADDRESS), state, TOKEN, 8, set())
-        self.assertIn("Monitoramento ativado", sent[0])
+        self.assertIn("TOKEN ADICIONADO", sent[0])
         self.assertIn("Wrapped SOL", sent[1])
         self.assertIn("+1.50%", sent[1])
         self.assertIn(ADDRESS, sent[1])
-        self.assertEqual(sent[2], "📊 Seus tokens monitorados:\nVocê ainda não está monitorando nenhum token.")
+        self.assertEqual(sent[2], "📋 MEUS TOKENS\n\nVocê ainda não está monitorando nenhum token.")
         self.assertEqual(sent[3], "Monitoramento removido.")
         self.assertEqual(state["watches"], {})
         self.assertEqual(save.call_count, 2)
@@ -184,13 +212,115 @@ class TelegramCommandTests(unittest.TestCase):
             address = f"{index:03d}" + ADDRESS
             watches[address] = {"address": address, "name": f"Token {index}", "symbol": f"T{index}", "last_price": 0.000123, "subscribers": ["11"]}
         sent = []
-        with patch.object(bot, "send_message", side_effect=lambda _token, _chat, text: sent.append(text)):
+        with patch.object(bot, "send_message", side_effect=lambda *args, **kwargs: sent.append(args[2])):
             bot.handle_update(self.update("/list"), {"watches": watches}, TOKEN, 10, set())
         self.assertGreater(len(sent), 1)
         self.assertTrue(all(len(text) <= 4096 for text in sent))
 
+    def test_price_without_argument_opens_only_this_chats_inline_token_menu(self):
+        state = {"watches": {
+            ADDRESS: {"address": ADDRESS, "symbol": "SOL", "subscribers": ["11"]},
+            "9" + ADDRESS: {"address": "9" + ADDRESS, "symbol": "OTHER", "subscribers": ["99"]},
+        }}
+        with patch.object(bot, "send_message") as send:
+            bot.handle_update(self.update("/price"), state, TOKEN, 10, set())
+        self.assertIn("ESCOLHA O TOKEN", send.call_args.args[2])
+        markup = send.call_args.args[3]
+        buttons = [button for row in markup["inline_keyboard"] for button in row]
+        self.assertEqual(len(buttons), 2)  # one token + refresh button
+        self.assertIn("SOL", buttons[0]["text"])
+        self.assertNotIn("OTHER", str(markup))
+        callback_data = buttons[0]["callback_data"]
+        self.assertLessEqual(len(callback_data.encode()), 64)
+        self.assertNotIn(ADDRESS, callback_data)
+
+    def test_token_selection_callback_answers_and_sends_current_price_with_link_buttons(self):
+        state = {"watches": {ADDRESS: {"address": ADDRESS, "symbol": "SOL", "subscribers": ["11"]}}}
+        with patch.object(bot, "answer_callback") as answer:
+            with patch.object(bot, "get_market_data", return_value=DEX_PAIR) as market:
+                with patch.object(bot, "send_message") as send:
+                    bot.handle_callback_update(self.callback("p:" + bot.token_callback_id(ADDRESS)), state, TOKEN, 10, set())
+        answer.assert_called_once_with(TOKEN, "cb-1", None)
+        market.assert_called_once_with(ADDRESS)
+        self.assertIn("$150.25", send.call_args.args[2])
+        markup = send.call_args.args[3]
+        self.assertIn("https://dexscreener.com/solana/example", str(markup))
+        self.assertIn("geckoterminal.com/solana/tokens/", str(markup))
+
+    def test_refresh_callback_answers_and_rebuilds_price_menu(self):
+        state = {"watches": {ADDRESS: {"address": ADDRESS, "symbol": "SOL", "subscribers": ["11"]}}}
+        with patch.object(bot, "answer_callback") as answer:
+            with patch.object(bot, "send_message") as send:
+                bot.handle_callback_update(self.callback("p_refresh:0"), state, TOKEN, 10, set())
+        answer.assert_called_once()
+        self.assertIn("ESCOLHA O TOKEN", send.call_args.args[2])
+
+    def test_remove_callback_confirms_then_removes_only_current_chat(self):
+        state = {"watches": {ADDRESS: {"address": ADDRESS, "name": "Wrapped SOL", "subscribers": ["11", "99"]}}}
+        callback_key = bot.token_callback_id(ADDRESS)
+        with patch.object(bot, "answer_callback") as answer:
+            with patch.object(bot, "send_message") as send:
+                bot.handle_callback_update(self.callback("r:" + callback_key), state, TOKEN, 10, set())
+                self.assertIn("Remover Wrapped SOL", send.call_args.args[2])
+                confirm_markup = send.call_args.args[3]
+                confirm_data = confirm_markup["inline_keyboard"][0][0]["callback_data"]
+                bot.handle_callback_update(self.callback(confirm_data, callback_id="cb-2"), state, TOKEN, 10, set())
+        self.assertEqual(answer.call_count, 2)
+        self.assertEqual(state["watches"][ADDRESS]["subscribers"], ["99"])
+
+    def test_add_callback_flow_previews_confirms_and_persists_token(self):
+        state = {"watches": {}, "awaiting_add": {}, "pending_add": {}}
+        with patch.object(bot, "save_state") as save:
+            with patch.object(bot, "answer_callback") as answer:
+                with patch.object(bot, "send_message") as send:
+                    bot.handle_callback_update(self.callback("add_begin"), state, TOKEN, 10, set())
+                    self.assertIn("Envie o endereço", send.call_args.args[2])
+                    with patch.object(bot, "get_market_data", return_value=DEX_PAIR) as market:
+                        bot.handle_update(self.update(ADDRESS), state, TOKEN, 10, set())
+                        preview_markup = send.call_args.args[3]
+                        confirm_data = preview_markup["inline_keyboard"][0][0]["callback_data"]
+                        self.assertIn("TOKEN ENCONTRADO", send.call_args.args[2])
+                        bot.handle_callback_update(self.callback(confirm_data, callback_id="cb-2"), state, TOKEN, 10, set())
+                    self.assertIn("MONITORAMENTO ATIVADO", send.call_args.args[2])
+        self.assertEqual(market.call_count, 2)
+        self.assertEqual(answer.call_count, 2)
+        self.assertEqual(state["watches"][ADDRESS]["subscribers"], ["11"])
+        self.assertGreaterEqual(save.call_count, 3)
+
+    def test_callback_is_answered_even_when_action_is_stale_or_unknown(self):
+        with patch.object(bot, "answer_callback") as answer:
+            with patch.object(bot, "send_message"):
+                bot.handle_callback_update(self.callback("unknown_action"), {"watches": {}}, TOKEN, 10, set())
+        answer.assert_called_once_with(TOKEN, "cb-1", None)
+
+    def test_list_empty_and_price_token_not_found_have_clear_responses(self):
+        with patch.object(bot, "send_message") as send:
+            bot.handle_update(self.update("/list"), {"watches": {}}, TOKEN, 10, set())
+        self.assertIn("Você ainda não está monitorando", send.call_args_list[0].args[2])
+        with patch.object(bot, "get_market_data", return_value=None):
+            with patch.object(bot, "send_message") as missing:
+                bot.handle_update(self.update("/price " + ADDRESS), {"watches": {}}, TOKEN, 10, set())
+        self.assertIn("não encontrado", missing.call_args.args[2])
+
 
 class PollingTests(unittest.TestCase):
+    def test_state_migration_keeps_existing_watch_reference_and_subscribers(self):
+        path = Path(__file__).resolve().parent / ".state-migration-test.json"
+        legacy = {"offset": 41, "watches": {ADDRESS.lower(): {"address": ADDRESS, "subscribers": ["11"], "anchor_price": "0.5", "last_alert": 123}}}
+        try:
+            path.write_text(json.dumps(legacy), encoding="utf-8")
+            with patch.object(bot, "STATE_FILE", path):
+                migrated = bot.load_state()
+        finally:
+            path.unlink(missing_ok=True)
+        self.assertEqual(migrated["offset"], 41)
+        self.assertIn(ADDRESS, migrated["watches"])
+        entry = migrated["watches"][ADDRESS]
+        self.assertEqual(entry["subscribers"], ["11"])
+        self.assertEqual(entry["anchor_price"], "0.5")
+        self.assertEqual(entry["last_alert"], 123)
+        self.assertIn("timestamp", entry)
+
     def test_six_hour_workflow_settings_and_token_secret_wiring_are_preserved(self):
         workflow = (Path(__file__).resolve().parents[1] / ".github" / "workflows" / "telegram-bot.yml").read_text(encoding="utf-8")
         self.assertIn('cron: "0 0,6,12,18 * * *"', workflow)
@@ -230,6 +360,7 @@ class PollingTests(unittest.TestCase):
         get_updates = next(payload for method, payload in calls if method == "getUpdates")
         self.assertEqual(get_updates["offset"], 0)
         self.assertEqual(get_updates["timeout"], 1)
+        self.assertEqual(get_updates["allowed_updates"], ["message", "callback_query"])
         self.assertEqual(state["offset"], 33)
 
 
