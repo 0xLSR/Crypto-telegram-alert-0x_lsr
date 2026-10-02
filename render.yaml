@@ -1,0 +1,28 @@
+services:
+  - type: worker
+    name: crypto-telegram-alert-bot
+    runtime: python
+    region: oregon
+    plan: 0.5c-512mb
+    numInstances: 1
+    autoDeployTrigger: commit
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    maxShutdownDelaySeconds: 60
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.11
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_ALLOWED_USER_IDS
+        sync: false
+      - key: ALERT_THRESHOLD_PERCENT
+        value: "10"
+      - key: ALERT_COOLDOWN_MINUTES
+        value: "30"
+      - key: BOT_STATE_FILE
+        value: /var/data/state.json
+    disk:
+      name: bot-state
+      mountPath: /var/data
+      sizeGB: 1

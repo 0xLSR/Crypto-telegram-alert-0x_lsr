@@ -1,71 +1,64 @@
 # Crypto-telegram-alert-0x_lsr
 
-Bot de alertas de criptomoedas no Telegram, com suporte inicial a tokens Solana e dados públicos do [DexScreener](https://docs.dexscreener.com/api/reference).
+Bot de alertas Telegram para tokens Solana, usando os dados públicos do [DexScreener](https://docs.dexscreener.com/api/reference). O processo foi projetado para permanecer em execução como um worker contínuo. GitHub Actions executa somente CI; não faz polling do Telegram.
 
-## Recursos
+## Comandos
 
 - `/start` e `/help`: instruções.
-- `/price <TOKEN ou endereço>`: preço, variação de 24h, liquidez, volume, market cap/FDV e link do DexScreener.
-- `/watch <endereço Solana>` e `/unwatch <endereço>`: iniciar/parar monitoramento.
-- `/list`: listar os tokens que este chat acompanha.
-- Alertas por variação percentual configurável, com referência atualizada após cada alerta e período mínimo entre alertas.
-- Estado persistido atomicamente em `data/state.json` (offset do Telegram e tokens acompanhados).
+- `/price SOL` ou `/price <endereço>`: preço, variação em 24h, liquidez, volume e market cap/FDV quando disponíveis.
+- `/watch <endereço Solana>` e `/unwatch <endereço>`: acompanhar/remover um token.
+- `/list`: listar os tokens acompanhados por este chat.
 
-Para buscas por símbolo, o bot escolhe o par Solana de maior liquidez, priorizando correspondência exata do símbolo/nome. Endereços são a forma recomendada para identificar tokens sem ambiguidade. Os dados e sua disponibilidade dependem do DexScreener.
+O limiar é configurado por `ALERT_THRESHOLD_PERCENT` (padrão 10%) e o intervalo mínimo entre alertas por token por `ALERT_COOLDOWN_MINUTES` (padrão 30). A verificação de mercado ocorre a cada minuto por padrão e só chama o DexScreener quando há tokens acompanhados. Consultas de monitoramento são agrupadas em lotes de até 30 endereços. Falhas do DexScreener são registradas e tentadas novamente; não interrompem o polling do Telegram.
 
-## Configuração local
+O bot chama `getMe` e remove eventual webhook sem descartar atualizações pendentes na inicialização. Ele então usa `getUpdates` com timeout Telegram de 25 segundos, o que permite respostas imediatas sem polling agressivo. Erros de rede/API aparecem nos logs com serviço, código HTTP e resposta; o token é removido dos diagnósticos.
 
-Requer Python 3.10 ou superior. O bot usa apenas a biblioteca padrão do Python; `requirements.txt` não tem dependências externas.
+## Hospedagem contínua no Render
 
-1. Crie um bot no Telegram falando com [@BotFather](https://t.me/BotFather) e copie o token.
-2. Defina o token no ambiente, sem colocá-lo no código ou em arquivos versionados:
+O arquivo `render.yaml` define um **Background Worker** Python de 0,5 CPU/512 MB com uma instância, deploy automático após commits e disco persistente montado em `/var/data`. O estado, incluindo `offset` e a lista de tokens, fica em `/var/data/state.json`. O processo se reconecta após falhas temporárias de rede; o Render executa o worker continuamente e reinicia processos que encerram por falha. Consulte a [documentação de Background Workers](https://render.com/docs/background-workers), [deploys](https://render.com/docs/deploys) e [discos persistentes](https://render.com/docs/disks).
 
-   ```powershell
-   $env:TELEGRAM_BOT_TOKEN = "seu-token"
-   python bot.py
-   ```
+### Primeira implantação
 
-   No macOS/Linux: `export TELEGRAM_BOT_TOKEN="seu-token"` e depois `python3 bot.py`.
-3. Abra o bot no Telegram e envie `/start`.
+1. Crie uma conta no Render e escolha **New → Blueprint**. Conecte o repositório `0xLSR/Crypto-telegram-alert-0x_lsr` e a branch `main`; o Render lerá `render.yaml` e criará o worker.
+2. No painel do worker, abra **Environment** e defina `TELEGRAM_BOT_TOKEN` com um token ativo fornecido pelo `@BotFather`. Nunca coloque o token em um commit, issue ou log. Não envie o token a terceiros.
+3. Opcionalmente defina `TELEGRAM_ALLOWED_USER_IDS` como IDs numéricos separados por vírgula. Se ficar vazio, qualquer pessoa que encontrar o bot poderá enviar comandos.
+4. Salve o ambiente e aguarde o deploy. Confira **Events** e **Logs**; um início válido registra que `getMe` autenticou o bot. Abra o chat do bot, pressione **Start** ou envie `/start`.
+5. A partir daí, pushes na branch conectada fazem deploy automático. Para atualizar o código, faça commit e push em `main`; para mudar secrets/variáveis, edite **Environment** no Render.
 
-O estado local é criado em `data/state.json`. Para outro local, defina `BOT_STATE_FILE`. Faça backup desse arquivo para preservar watches e atualizações processadas.
+O plano de worker e o disco persistente são pagos. Consulte [preços atuais do Render](https://render.com/pricing) antes de provisionar. O disco é necessário para manter o estado após reinicializações; mantenha `numInstances: 1`, pois múltiplas instâncias com o mesmo offset e disco não são suportadas por este consumidor único de `getUpdates`.
 
-## Configuração no GitHub Actions
+### Configuração do worker
 
-O workflow `.github/workflows/telegram-bot.yml` inicia o bot em execuções agendadas, a cada cinco minutos, e cada execução monitora por quatro minutos. Configure no repositório em **Settings → Secrets and variables → Actions**:
+| Variável | Tipo | Padrão | Uso |
+| --- | --- | --- | --- |
+| `TELEGRAM_BOT_TOKEN` | Secret obrigatório | — | Token privado do BotFather. |
+| `TELEGRAM_ALLOWED_USER_IDS` | Secret opcional | vazio | IDs autorizados, separados por vírgula. |
+| `ALERT_THRESHOLD_PERCENT` | variável | `10` | Movimento percentual mínimo (0,1–1000). |
+| `ALERT_COOLDOWN_MINUTES` | variável | `30` | Espera mínima entre alertas (1–10080 min). |
+| `BOT_STATE_FILE` | variável | `/var/data/state.json` no Render | Caminho persistente para offset e watches. |
+| `PRICE_CHECK_SECONDS` | variável opcional | `60` | Intervalo de monitoramento de preços, mínimo 15 s. |
+| `LOG_LEVEL` | variável opcional | `INFO` | Nível dos logs. |
 
-### Secrets obrigatórios
+**Atenção ao erro `Telegram API 401: Unauthorized`:** esse resultado de `getMe` significa que o token atualmente configurado no serviço é inválido, foi revogado ou foi copiado incorretamente. O token não pode ser corrigido por uma alteração no código. Gere/consulte um token ativo no BotFather e substitua o valor diretamente em **Render → serviço → Environment → `TELEGRAM_BOT_TOKEN`**, sem compartilhá-lo. O valor existente de `TELEGRAM_BOT_TOKEN` no GitHub não é copiado automaticamente para o Render (secrets são write-only) e o bot só responderá depois que a autenticação passar. O bot nunca registra o token.
 
-| Nome | Conteúdo |
-| --- | --- |
-| `TELEGRAM_BOT_TOKEN` | Token fornecido pelo BotFather. |
+## Desenvolvimento local
 
-### Secrets opcionais
+Requer Python 3.12 ou superior; o projeto usa apenas a biblioteca padrão. Configure o token no ambiente e execute `python bot.py`:
 
-| Nome | Conteúdo |
-| --- | --- |
-| `TELEGRAM_ALLOWED_USER_IDS` | IDs numéricos autorizados separados por vírgula, por exemplo `12345678,98765432`. Vazio permite comandos de qualquer pessoa que encontre o bot. |
-
-### Variables opcionais
-
-| Nome | Padrão | Significado |
-| --- | --- | --- |
-| `ALERT_THRESHOLD_PERCENT` | `10` | Variação absoluta mínima em % desde o último alerta (de `0.1` a `1000`). |
-| `ALERT_COOLDOWN_MINUTES` | `30` | Intervalo mínimo entre alertas do mesmo token (de `1` a `10080`). |
-
-Depois de salvar o secret, habilite **Actions** no repositório e execute o workflow manualmente uma vez em **Actions → Telegram Crypto Alerts → Run workflow**. Agendamentos do GitHub podem atrasar, ser suspensos em repositórios inativos e não oferecem execução contínua. O cache do Actions preserva o arquivo de estado entre execuções, mas pode expirar ou ser removido; exporte/guarde `data/state.json` se precisar de persistência garantida. Para disponibilidade contínua e estado durável, rode `python bot.py` em um servidor/serviço sempre ligado com armazenamento persistente.
-
-Não imprima nem compartilhe o token. O bot evita registrá-lo nos logs. Se ele for exposto, revogue-o pelo BotFather e atualize o Secret.
-
-## Execução e configuração
-
-```text
-TELEGRAM_BOT_TOKEN                 obrigatório
-TELEGRAM_ALLOWED_USER_IDS          opcional; IDs separados por vírgula
-ALERT_THRESHOLD_PERCENT            padrão 10
-ALERT_COOLDOWN_MINUTES             padrão 30
-BOT_STATE_FILE                     padrão data/state.json
-RUN_FOR_SECONDS                    padrão 0 (executa até ser encerrado)
+```powershell
+$env:TELEGRAM_BOT_TOKEN = "token obtido no BotFather"
+python bot.py
 ```
 
-O Telegram permite um único consumidor de `getUpdates` por bot. Não execute ao mesmo tempo uma cópia local e o workflow, pois ambos podem disputar as atualizações.
+O estado local é `data/state.json`. Em produção, o Blueprint aponta para o disco persistente. Não rode uma cópia local simultaneamente ao worker: um bot Telegram só deve ter um consumidor de `getUpdates`.
+
+## GitHub Actions
+
+`.github/workflows/telegram-bot.yml` roda validação de sintaxe e testes em `push` e `pull_request`. Não há schedule, polling, token secreto ou processo do bot no Actions. O Render é responsável pela execução contínua e pelo deploy automático.
+
+## Testes
+
+```sh
+python -m py_compile bot.py tests/test_telegram_api.py
+python -m unittest discover -s tests -v
+```

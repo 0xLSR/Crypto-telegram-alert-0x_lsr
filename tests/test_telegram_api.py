@@ -150,10 +150,16 @@ class TelegramApiTests(unittest.TestCase):
             bot.check_prices({"watches": {}}, "test-token", 10.0, 1800.0)
         get_pair.assert_not_called()
 
-    def test_short_poll_timeout_is_one_second(self):
-        self.assertEqual(bot.TELEGRAM_POLL_TIMEOUT_SECONDS, 1)
+    def test_dexscreener_monitoring_failure_does_not_escape_price_cycle(self):
+        address = "So11111111111111111111111111111111111111112"
+        state = {"watches": {address.lower(): {"address": address, "subscribers": []}}}
+        with patch.object(bot, "http_json", side_effect=bot.DexScreenerError("temporary outage")):
+            bot.check_prices(state, "test-token", 10.0, 1800.0)
 
-    def test_main_processes_pending_update_with_short_poll_and_saves_offset(self):
+    def test_continuous_poll_uses_telegram_long_poll_for_low_latency(self):
+        self.assertEqual(bot.TELEGRAM_POLL_TIMEOUT_SECONDS, 25)
+
+    def test_main_processes_pending_update_and_saves_offset(self):
         state = {"offset": 0, "watches": {}}
         saved_states = []
         update = {
@@ -168,21 +174,23 @@ class TelegramApiTests(unittest.TestCase):
 
         def fake_telegram(token, method, payload=None):
             calls.append((token, method, payload))
-            return [update] if method == "getUpdates" else None
+            if method == "getUpdates":
+                bot.STOP.set()
+                return [update]
+            return None
 
-        with patch.dict(os.environ, {"TELEGRAM_BOT_TOKEN": "test-token", "RUN_FOR_SECONDS": "0.01"}):
+        with patch.dict(os.environ, {"TELEGRAM_BOT_TOKEN": "test-token"}):
             with patch.object(bot, "validate_telegram", side_effect=lambda _token: calls.append(("preflight",))):
                 with patch.object(bot, "telegram", side_effect=fake_telegram):
                     with patch.object(bot, "load_state", return_value=state):
                         with patch.object(bot, "save_state", side_effect=lambda value: saved_states.append(dict(value))):
                             with patch.object(bot, "send_message") as send_message:
-                                with patch.object(bot.time, "monotonic", side_effect=[0.0, 0.0, 1.0]):
-                                    with patch.object(bot.signal, "signal"):
-                                        self.assertEqual(bot.main(), 0)
+                                with patch.object(bot.signal, "signal"):
+                                    self.assertEqual(bot.main(), 0)
 
         self.assertEqual(calls[0], ("preflight",))
         self.assertEqual(calls[1][1], "getUpdates")
-        self.assertEqual(calls[1][2]["timeout"], 1)
+        self.assertEqual(calls[1][2]["timeout"], 25)
         self.assertEqual(calls[1][2]["offset"], 0)
         self.assertTrue(send_message.called)
         self.assertEqual(state["offset"], 35)
