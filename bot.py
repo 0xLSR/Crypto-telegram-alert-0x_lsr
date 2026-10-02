@@ -74,6 +74,18 @@ def http_json(url: str, *, method: str = "GET", payload: dict[str, Any] | None =
     try:
         with urllib.request.urlopen(request, timeout=25) as response:
             result = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        response_body = exc.read().decode("utf-8", errors="replace")
+        # Telegram embeds the bot token in the request path. Never log the URL,
+        # and redact the token in case an upstream error body echoes the URL.
+        path = urllib.parse.urlsplit(url).path
+        token_match = re.search(r"/bot([^/]+)/", path)
+        if token_match:
+            token = token_match.group(1)
+            response_body = response_body.replace(token, "[REDACTED]")
+            response_body = response_body.replace(f"bot{token}", "bot[REDACTED]")
+        LOG.error("Erro HTTP %s; corpo da resposta: %s", exc.code, response_body[:4000])
+        raise BotError(f"Falha HTTP {exc.code} na API externa.") from exc
     except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
         raise BotError("Falha na comunicação com a API externa.") from exc
     return result
@@ -82,8 +94,26 @@ def http_json(url: str, *, method: str = "GET", payload: dict[str, Any] | None =
 def telegram(token: str, method: str, payload: dict[str, Any] | None = None) -> Any:
     result = http_json(API_BASE.format(token=token, method=method), method="POST", payload=payload or {})
     if not result.get("ok"):
-        raise BotError(f"Telegram recusou a operação {method}.")
+        error_code = result.get("error_code", "desconhecido")
+        description = str(result.get("description") or "sem descrição")
+        description = description.replace(token, "[REDACTED]")
+        raise BotError(f"Telegram API {error_code}: {description}")
     return result.get("result")
+
+
+def validate_telegram(token: str) -> None:
+    """Validate credentials and make long polling available before getUpdates."""
+    bot_info = telegram(token, "getMe")
+    if not isinstance(bot_info, dict) or not bot_info.get("id"):
+        raise BotError("Telegram getMe não retornou a identidade do bot.")
+    webhook_removed = telegram(token, "deleteWebhook", {"drop_pending_updates": False})
+    if webhook_removed is not True:
+        raise BotError("Telegram não confirmou a remoção do webhook.")
+    LOG.info(
+        "Token validado com getMe (bot id=%s, username=@%s); webhook removido sem descartar atualizações pendentes.",
+        bot_info["id"],
+        bot_info.get("username", "indisponível"),
+    )
 
 
 def send_message(token: str, chat_id: int | str, text: str) -> None:
@@ -248,6 +278,11 @@ def main() -> int:
         run_seconds = env_float("RUN_FOR_SECONDS", 0.0, 0, 86400)
     except BotError as exc:
         LOG.error("Configuração inválida: %s", exc)
+        return 2
+    try:
+        validate_telegram(token)
+    except BotError as exc:
+        LOG.error("Falha na validação inicial do Telegram: %s", exc)
         return 2
     allowed_ids = {value.strip() for value in os.getenv("TELEGRAM_ALLOWED_USER_IDS", "").split(",") if value.strip()}
     state = load_state()
