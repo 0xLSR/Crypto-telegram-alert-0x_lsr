@@ -1,26 +1,49 @@
-name: Bot CI
+name: Telegram Crypto Alerts
 
 on:
-  push:
-    branches: [main]
-  pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  group: bot-ci-${{ github.ref }}
-  cancel-in-progress: true
+  group: telegram-bot-polling
+  cancel-in-progress: false
 
 jobs:
-  validate:
+  monitor:
     runs-on: ubuntu-latest
+    timeout-minutes: 360
+    env:
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_ALLOWED_USER_IDS: ${{ secrets.TELEGRAM_ALLOWED_USER_IDS }}
+      ALERT_THRESHOLD_PERCENT: ${{ vars.ALERT_THRESHOLD_PERCENT || '10' }}
+      ALERT_COOLDOWN_MINUTES: ${{ vars.ALERT_COOLDOWN_MINUTES || '30' }}
+      RUN_FOR_SECONDS: "21000"
+      BOT_STATE_FILE: data/state.json
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: Validate Python syntax
-        run: python -m py_compile bot.py tests/test_telegram_api.py
-      - name: Run tests
-        run: python -m unittest discover -s tests -v
+
+      - name: Restore bot state cache
+        uses: actions/cache@v4
+        with:
+          path: data/state.json
+          key: ${{ runner.os }}-telegram-bot-state-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            ${{ runner.os }}-telegram-bot-state-
+
+      - name: Validate configuration
+        run: |
+          if [ -z "$TELEGRAM_BOT_TOKEN" ]; then
+            echo "Configure the TELEGRAM_BOT_TOKEN repository secret."
+            exit 1
+          fi
+
+      - name: Run bot polling window
+        run: python bot.py

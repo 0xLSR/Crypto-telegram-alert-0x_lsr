@@ -1,6 +1,6 @@
 # Crypto-telegram-alert-0x_lsr
 
-Bot de alertas Telegram para tokens Solana, usando os dados públicos do [DexScreener](https://docs.dexscreener.com/api/reference). O processo foi projetado para permanecer em execução como um worker contínuo. GitHub Actions executa somente CI; não faz polling do Telegram.
+Bot de alertas Telegram para tokens Solana, usando os dados públicos do [DexScreener](https://docs.dexscreener.com/api/reference). É possível iniciar o polling manualmente pelo GitHub Actions. Para execução realmente contínua sem reiniciar manualmente, use o Background Worker do Render descrito abaixo.
 
 ## Comandos
 
@@ -12,6 +12,12 @@ Bot de alertas Telegram para tokens Solana, usando os dados públicos do [DexScr
 O limiar é configurado por `ALERT_THRESHOLD_PERCENT` (padrão 10%) e o intervalo mínimo entre alertas por token por `ALERT_COOLDOWN_MINUTES` (padrão 30). A verificação de mercado ocorre a cada minuto por padrão e só chama o DexScreener quando há tokens acompanhados. Consultas de monitoramento são agrupadas em lotes de até 30 endereços. Falhas do DexScreener são registradas e tentadas novamente; não interrompem o polling do Telegram.
 
 O bot chama `getMe` e remove eventual webhook sem descartar atualizações pendentes na inicialização. Ele então usa `getUpdates` com timeout Telegram de 25 segundos, o que permite respostas imediatas sem polling agressivo. Erros de rede/API aparecem nos logs com serviço, código HTTP e resposta; o token é removido dos diagnósticos.
+
+## Execução manual pelo GitHub Actions
+
+Em **Actions → Telegram Crypto Alerts → Run workflow**, inicie o bot manualmente. O job recebe `TELEGRAM_BOT_TOKEN` dos GitHub Secrets e monitora por 5 horas e 50 minutos, salvando offset e watches no cache ao terminar. Para continuar usando Actions, inicie uma nova execução depois que a anterior terminar.
+
+O GitHub encerra jobs em runners hospedados após no máximo 6 horas; por isso, uma execução manual no Actions não consegue manter o bot 24 horas por dia sem intervenção. [Limites oficiais do GitHub Actions](https://docs.github.com/en/enterprise-cloud%40latest/actions/reference/limits). O evento `workflow_dispatch` habilita o botão **Run workflow**. [Iniciar workflows manualmente](https://docs.github.com/en/actions/how-tos/manage-workflow-runs/manually-run-a-workflow)
 
 ## Hospedagem contínua no Render
 
@@ -50,11 +56,11 @@ $env:TELEGRAM_BOT_TOKEN = "token obtido no BotFather"
 python bot.py
 ```
 
-O estado local é `data/state.json`. Em produção, o Blueprint aponta para o disco persistente. Não rode uma cópia local simultaneamente ao worker: um bot Telegram só deve ter um consumidor de `getUpdates`.
+O estado local é `data/state.json`. Em produção, o Blueprint aponta para o disco persistente e o Actions restaura/salva o cache entre execuções. Não rode uma cópia local simultaneamente ao Render ou ao Actions: um bot Telegram só deve ter um consumidor de `getUpdates`.
 
 ## GitHub Actions
 
-`.github/workflows/telegram-bot.yml` roda validação de sintaxe e testes em `push` e `pull_request`. Não há schedule, polling, token secreto ou processo do bot no Actions. O Render é responsável pela execução contínua e pelo deploy automático.
+`.github/workflows/telegram-bot.yml` inicia o bot somente quando acionado manualmente. `.github/workflows/ci.yml` valida sintaxe e executa testes em `push` e `pull_request`. Não há schedule automático. Não deixe o worker do Render e o workflow manual rodando ao mesmo tempo: ambos consumiriam `getUpdates` do mesmo bot.
 
 ## Testes
 

@@ -345,6 +345,7 @@ def main() -> int:
     try:
         threshold = env_float("ALERT_THRESHOLD_PERCENT", 10, 0.1, 1000)
         cooldown = env_float("ALERT_COOLDOWN_MINUTES", 30, 1, 10080) * 60
+        run_seconds = env_float("RUN_FOR_SECONDS", 0, 0, 86400)
     except BotError as exc:
         LOG.error("Configuração inválida: %s", exc)
         return 2
@@ -375,7 +376,8 @@ def main() -> int:
     monitor = threading.Thread(target=market_monitor, args=(state, token, threshold, cooldown), name="dexscreener-monitor", daemon=True)
     monitor.start()
     failures = 0
-    while not STOP.is_set():
+    deadline = time.monotonic() + run_seconds if run_seconds else None
+    while not STOP.is_set() and (deadline is None or time.monotonic() < deadline):
         try:
             updates = telegram(token, "getUpdates", {"offset": int(state["offset"]), "timeout": TELEGRAM_POLL_TIMEOUT_SECONDS, "allowed_updates": ["message"]}) or []
             failures = 0
@@ -395,7 +397,7 @@ def main() -> int:
             STOP.wait(delay)
     with STATE_LOCK:
         save_state(state)
-    LOG.info("Encerrando worker; aguardando o monitor concluir.")
+    LOG.info("Janela de execução encerrada; estado salvo. Aguardando o monitor concluir.")
     monitor.join(timeout=10)
     return 0
 
