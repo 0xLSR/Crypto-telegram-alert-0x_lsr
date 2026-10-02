@@ -62,6 +62,15 @@ class TokenValidationTests(unittest.TestCase):
         self.assertIn("@sample_bot", "\n".join(logs.output))
         self.assertEqual(request.call_args_list[1].args, (TOKEN, "deleteWebhook", {"drop_pending_updates": False}))
 
+    def test_native_telegram_command_menu_is_portuguese_and_contains_only_requested_commands(self):
+        with patch.object(bot, "telegram", return_value=True) as request:
+            bot.configure_bot_commands(TOKEN)
+        self.assertEqual(request.call_args.args[1], "setMyCommands")
+        commands = request.call_args.args[2]["commands"]
+        self.assertEqual([command["command"] for command in commands], ["start", "price", "list", "watch", "unwatch", "help"])
+        self.assertEqual([command["description"] for command in commands],
+                         ["Abrir menu", "Consultar preço", "Minha lista", "Adicionar alerta", "Remover alerta", "Ajuda"])
+
 
 class AddressAndParserTests(unittest.TestCase):
     def test_base58_public_key_validation_and_parser(self):
@@ -115,8 +124,9 @@ class MarketDataTests(unittest.TestCase):
         gecko.assert_called_once_with(ADDRESS)
         dex.assert_not_called()
         summary = bot.pair_summary(pair)
-        for expected in ("Wrapped SOL", "SOL", "$150.25", "+1.50%", "$100K", "$25K", "$900K", "$1M", ADDRESS, "SOLANA"):
+        for expected in ("Wrapped SOL", "SOL", "$150.25", "+1.50%", "$100K", "$25K", "$900K", "$1M", bot.short_address(ADDRESS), "Solana", "Capitalização"):
             self.assertIn(expected, summary)
+        self.assertNotIn(ADDRESS, summary)
 
     def test_gecko_failure_falls_back_to_dexscreener(self):
         with patch.object(bot, "get_gecko_pair", side_effect=bot.GeckoTerminalError("offline")):
@@ -160,6 +170,44 @@ class TelegramCommandTests(unittest.TestCase):
         self.assertIn("SOL", sent[3])
         self.assertEqual(market.call_count, 2)
 
+    def test_start_menu_is_clean_portuguese_and_contains_no_technical_commands(self):
+        with patch.object(bot, "send_message") as send:
+            bot.handle_update(self.update("/start"), {"watches": {}}, TOKEN, 10, set())
+        text, markup = send.call_args.args[2:4]
+        self.assertIn("Seu painel de tokens Solana", text)
+        for command in ("/price", "/watch", "/unwatch", "/list", "/help"):
+            self.assertNotIn(command, text)
+        labels = [button["text"] for row in markup["inline_keyboard"] for button in row]
+        self.assertEqual(labels, ["💰 Consultar preço", "🔔 Meus alertas", "➕ Adicionar token", "📋 Minha lista", "ℹ️ Ajuda"])
+
+    def test_menu_alerts_list_and_back_callbacks_edit_same_message_and_answer_every_callback(self):
+        state = {"watches": {
+            ADDRESS: {"address": ADDRESS, "name": "Wrapped SOL", "symbol": "SOL", "subscribers": ["11"], "last_price": 1.0},
+            "9" + ADDRESS: {"address": "9" + ADDRESS, "name": "Rizzmas", "symbol": "RIZZ", "subscribers": ["11"], "last_price": 2.0},
+        }}
+        with patch.object(bot, "answer_callback") as answer, patch.object(bot, "edit_message") as edit, patch.object(bot, "save_state"):
+            for index, data in enumerate(("alerts", "watch_list", "menu", "help", "price_menu", "remove_menu", "add_begin")):
+                bot.handle_callback_update(self.callback(data, callback_id=f"cb-{index}"), state, TOKEN, 10, set())
+        self.assertEqual(answer.call_count, 7)
+        self.assertEqual(edit.call_count, 7)
+        alert_call = edit.call_args_list[0]
+        self.assertIn("Limite: ±10%", alert_call.args[3])
+        list_call = edit.call_args_list[1]
+        self.assertIn("RIZZ", list_call.args[3])
+        self.assertNotIn(ADDRESS, list_call.args[3])
+        self.assertIn("◀️ Voltar", str(list_call.args[4]))
+
+    def test_refresh_token_callback_edits_the_existing_message(self):
+        state = {"watches": {ADDRESS: {"address": ADDRESS, "symbol": "SOL", "subscribers": ["11"]}}}
+        lookup_id = bot.token_callback_id(ADDRESS)
+        bot.PRICE_LOOKUPS[lookup_id] = ADDRESS
+        with patch.object(bot, "answer_callback") as answer, patch.object(bot, "get_market_data", return_value=DEX_PAIR) as market, patch.object(bot, "edit_message") as edit:
+            bot.handle_callback_update(self.callback(f"u:{lookup_id}:p"), state, TOKEN, 10, set())
+        answer.assert_called_once()
+        market.assert_called_once_with(ADDRESS)
+        edit.assert_called_once()
+        self.assertEqual(edit.call_args.args[2], 99)
+
     def test_watch_list_unwatch_persist_and_scope_by_chat(self):
         state = {"offset": 0, "watches": {}}
         sent = []
@@ -172,9 +220,8 @@ class TelegramCommandTests(unittest.TestCase):
                     bot.handle_update(self.update("/unwatch " + ADDRESS), state, TOKEN, 8, set())
         self.assertIn("TOKEN ADICIONADO", sent[0])
         self.assertIn("Wrapped SOL", sent[1])
-        self.assertIn("+1.50%", sent[1])
-        self.assertIn(ADDRESS, sent[1])
-        self.assertEqual(sent[2], "📋 MEUS TOKENS\n\nVocê ainda não está monitorando nenhum token.")
+        self.assertNotIn(ADDRESS, sent[1])
+        self.assertEqual(sent[2], "📋 MINHA LISTA\n\nSua lista ainda está vazia.")
         self.assertEqual(sent[3], "Monitoramento removido.")
         self.assertEqual(state["watches"], {})
         self.assertEqual(save.call_count, 2)
@@ -212,10 +259,11 @@ class TelegramCommandTests(unittest.TestCase):
             address = f"{index:03d}" + ADDRESS
             watches[address] = {"address": address, "name": f"Token {index}", "symbol": f"T{index}", "last_price": 0.000123, "subscribers": ["11"]}
         sent = []
-        with patch.object(bot, "send_message", side_effect=lambda *args, **kwargs: sent.append(args[2])):
+        with patch.object(bot, "send_message", side_effect=lambda *args, **kwargs: sent.append(args[2])) as send:
             bot.handle_update(self.update("/list"), {"watches": watches}, TOKEN, 10, set())
-        self.assertGreater(len(sent), 1)
+        self.assertEqual(len(sent), 1)
         self.assertTrue(all(len(text) <= 4096 for text in sent))
+        self.assertEqual(len(send.call_args.args[3]["inline_keyboard"]), 13)
 
     def test_price_without_argument_opens_only_this_chats_inline_token_menu(self):
         state = {"watches": {
@@ -224,10 +272,11 @@ class TelegramCommandTests(unittest.TestCase):
         }}
         with patch.object(bot, "send_message") as send:
             bot.handle_update(self.update("/price"), state, TOKEN, 10, set())
-        self.assertIn("ESCOLHA O TOKEN", send.call_args.args[2])
+        self.assertIn("CONSULTAR PREÇO", send.call_args.args[2])
+        self.assertIn("Selecione um token", send.call_args.args[2])
         markup = send.call_args.args[3]
         buttons = [button for row in markup["inline_keyboard"] for button in row]
-        self.assertEqual(len(buttons), 2)  # one token + refresh button
+        self.assertEqual(len(buttons), 3)  # token + refresh + back
         self.assertIn("SOL", buttons[0]["text"])
         self.assertNotIn("OTHER", str(markup))
         callback_data = buttons[0]["callback_data"]
@@ -238,31 +287,33 @@ class TelegramCommandTests(unittest.TestCase):
         state = {"watches": {ADDRESS: {"address": ADDRESS, "symbol": "SOL", "subscribers": ["11"]}}}
         with patch.object(bot, "answer_callback") as answer:
             with patch.object(bot, "get_market_data", return_value=DEX_PAIR) as market:
-                with patch.object(bot, "send_message") as send:
+                with patch.object(bot, "edit_message") as edit:
                     bot.handle_callback_update(self.callback("p:" + bot.token_callback_id(ADDRESS)), state, TOKEN, 10, set())
         answer.assert_called_once_with(TOKEN, "cb-1", None)
         market.assert_called_once_with(ADDRESS)
-        self.assertIn("$150.25", send.call_args.args[2])
-        markup = send.call_args.args[3]
+        self.assertIn("$150.25", edit.call_args.args[3])
+        markup = edit.call_args.args[4]
+        self.assertIn("🔄 Atualizar", str(markup))
+        self.assertIn("◀️ Voltar", str(markup))
         self.assertIn("https://dexscreener.com/solana/example", str(markup))
         self.assertIn("geckoterminal.com/solana/tokens/", str(markup))
 
     def test_refresh_callback_answers_and_rebuilds_price_menu(self):
         state = {"watches": {ADDRESS: {"address": ADDRESS, "symbol": "SOL", "subscribers": ["11"]}}}
         with patch.object(bot, "answer_callback") as answer:
-            with patch.object(bot, "send_message") as send:
+            with patch.object(bot, "edit_message") as edit:
                 bot.handle_callback_update(self.callback("p_refresh:0"), state, TOKEN, 10, set())
         answer.assert_called_once()
-        self.assertIn("ESCOLHA O TOKEN", send.call_args.args[2])
+        self.assertIn("CONSULTAR PREÇO", edit.call_args.args[3])
 
     def test_remove_callback_confirms_then_removes_only_current_chat(self):
         state = {"watches": {ADDRESS: {"address": ADDRESS, "name": "Wrapped SOL", "subscribers": ["11", "99"]}}}
         callback_key = bot.token_callback_id(ADDRESS)
         with patch.object(bot, "answer_callback") as answer:
-            with patch.object(bot, "send_message") as send:
+            with patch.object(bot, "edit_message") as edit:
                 bot.handle_callback_update(self.callback("r:" + callback_key), state, TOKEN, 10, set())
-                self.assertIn("Remover Wrapped SOL", send.call_args.args[2])
-                confirm_markup = send.call_args.args[3]
+                self.assertIn("Deseja remover Wrapped SOL", edit.call_args.args[3])
+                confirm_markup = edit.call_args.args[4]
                 confirm_data = confirm_markup["inline_keyboard"][0][0]["callback_data"]
                 bot.handle_callback_update(self.callback(confirm_data, callback_id="cb-2"), state, TOKEN, 10, set())
         self.assertEqual(answer.call_count, 2)
@@ -272,16 +323,16 @@ class TelegramCommandTests(unittest.TestCase):
         state = {"watches": {}, "awaiting_add": {}, "pending_add": {}}
         with patch.object(bot, "save_state") as save:
             with patch.object(bot, "answer_callback") as answer:
-                with patch.object(bot, "send_message") as send:
+                with patch.object(bot, "send_message") as send, patch.object(bot, "edit_message") as edit:
                     bot.handle_callback_update(self.callback("add_begin"), state, TOKEN, 10, set())
-                    self.assertIn("Envie o endereço", send.call_args.args[2])
+                    self.assertIn("Envie o endereço", edit.call_args.args[3])
                     with patch.object(bot, "get_market_data", return_value=DEX_PAIR) as market:
                         bot.handle_update(self.update(ADDRESS), state, TOKEN, 10, set())
                         preview_markup = send.call_args.args[3]
                         confirm_data = preview_markup["inline_keyboard"][0][0]["callback_data"]
                         self.assertIn("TOKEN ENCONTRADO", send.call_args.args[2])
                         bot.handle_callback_update(self.callback(confirm_data, callback_id="cb-2"), state, TOKEN, 10, set())
-                    self.assertIn("MONITORAMENTO ATIVADO", send.call_args.args[2])
+                    self.assertIn("Adicionado aos seus alertas", edit.call_args.args[3])
         self.assertEqual(market.call_count, 2)
         self.assertEqual(answer.call_count, 2)
         self.assertEqual(state["watches"][ADDRESS]["subscribers"], ["11"])
@@ -289,14 +340,14 @@ class TelegramCommandTests(unittest.TestCase):
 
     def test_callback_is_answered_even_when_action_is_stale_or_unknown(self):
         with patch.object(bot, "answer_callback") as answer:
-            with patch.object(bot, "send_message"):
+            with patch.object(bot, "edit_message"):
                 bot.handle_callback_update(self.callback("unknown_action"), {"watches": {}}, TOKEN, 10, set())
         answer.assert_called_once_with(TOKEN, "cb-1", None)
 
     def test_list_empty_and_price_token_not_found_have_clear_responses(self):
         with patch.object(bot, "send_message") as send:
             bot.handle_update(self.update("/list"), {"watches": {}}, TOKEN, 10, set())
-        self.assertIn("Você ainda não está monitorando", send.call_args_list[0].args[2])
+        self.assertIn("lista ainda está vazia", send.call_args_list[0].args[2])
         with patch.object(bot, "get_market_data", return_value=None):
             with patch.object(bot, "send_message") as missing:
                 bot.handle_update(self.update("/price " + ADDRESS), {"watches": {}}, TOKEN, 10, set())

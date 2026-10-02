@@ -28,6 +28,7 @@ TELEGRAM_REQUEST_TIMEOUT_SECONDS = 15
 API_REQUEST_TIMEOUT_SECONDS = 15
 PRICE_CHECK_SECONDS = max(15, int(os.getenv("PRICE_CHECK_SECONDS", "60")))
 MAX_WATCHES = 100
+PRICE_LOOKUPS: dict[str, str] = {}
 LOG = logging.getLogger("crypto_alert_bot")
 STATE_LOCK = threading.RLock()
 STOP = threading.Event()
@@ -235,6 +236,18 @@ def validate_telegram(token: str) -> None:
     if telegram(token, "deleteWebhook", {"drop_pending_updates": False}) is not True:
         raise BotError("Telegram não confirmou a remoção do webhook.")
     LOG.info("Telegram autenticado como @%s; webhook removido preservando atualizações pendentes.", me.get("username", "indisponível"))
+
+
+def configure_bot_commands(token: str) -> None:
+    commands = [
+        {"command": "start", "description": "Abrir menu"},
+        {"command": "price", "description": "Consultar preço"},
+        {"command": "list", "description": "Minha lista"},
+        {"command": "watch", "description": "Adicionar alerta"},
+        {"command": "unwatch", "description": "Remover alerta"},
+        {"command": "help", "description": "Ajuda"},
+    ]
+    telegram(token, "setMyCommands", {"commands": commands})
 
 
 def send_message(token: str, chat_id: int | str, text: str, reply_markup: dict[str, Any] | None = None) -> None:
@@ -474,21 +487,26 @@ def pair_summary(pair: dict[str, Any]) -> str:
     change_text = percent(change)
     market_cap = pair.get("marketCap")
     fdv = pair.get("fdv")
-    cap_label = "💎 Market Cap" if market_cap is not None else "💎 FDV"
+    cap_label = "💎 Capitalização" if market_cap is not None else "💎 FDV"
     cap_value = market_cap if market_cap is not None else fdv
     name = base.get("name") or base.get("symbol") or "Token Solana"
     symbol = base.get("symbol")
     title = f"{change_icon(change)} {name}" + (f"\n${symbol}" if symbol and symbol.casefold() != str(name).casefold() else "")
-    result = (f"━━━━━━━━━━━━━━━━━━━━\n{title}\n━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"💰 PREÇO\n{money(pair.get('priceUsd'))}\n\n"
-        f"📈 24H\n{change_text}\n\n"
+    result = (f"{title}\n\n━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"💰 Preço\n{money(pair.get('priceUsd'))}\n\n"
+        f"📈 Variação 24h\n{change_text}\n\n"
         f"{cap_label}\n{compact(cap_value)}")
     if market_cap is not None and fdv is not None:
         result += f"\n\n📉 FDV\n{compact(fdv)}"
-    result += (f"\n\n💧 LIQUIDEZ\n{compact((pair.get('liquidity') or {}).get('usd'))}"
+    result += (f"\n\n💧 Liquidez\n{compact((pair.get('liquidity') or {}).get('usd'))}"
         f"\n\n📊 VOLUME 24H\n{compact((pair.get('volume') or {}).get('h24'))}"
-        f"\n\n━━━━━━━━━━━━━━━━━━━━\n⛓️ SOLANA\n\n📍 CONTRATO\n{base.get('address', 'indisponível')}\n\nAtualizado agora.")
+        f"\n\n━━━━━━━━━━━━━━━━━━━━\n⛓️ Solana\n\n📍 Contrato\n{short_address(base.get('address'))}\n\nAtualizado agora.")
     return result
+
+
+def short_address(value: Any) -> str:
+    address = str(value or "indisponível")
+    return address if len(address) <= 12 else f"{address[:5]}...{address[-5:]}"
 
 
 def pair_links_markup(pair: dict[str, Any]) -> dict[str, Any] | None:
@@ -531,22 +549,42 @@ def button(text: str, callback: str) -> dict[str, str]:
 
 def main_menu_markup() -> dict[str, Any]:
     return {"inline_keyboard": [
-        [button("💰 Preço", "price_menu"), button("🔔 Meus alertas", "watch_list")],
+        [button("💰 Consultar preço", "price_menu"), button("🔔 Meus alertas", "alerts")],
         [button("➕ Adicionar token", "add_begin"), button("📋 Minha lista", "watch_list")],
         [button("ℹ️ Ajuda", "help")],
     ]}
 
 
 def list_actions_markup() -> dict[str, Any]:
-    return {"inline_keyboard": [[button("📊 Ver preço", "price_menu"), button("➕ Adicionar token", "add_begin")],
-                                [button("❌ Remover token", "remove_menu")]]}
+    return {"inline_keyboard": [[button("➕ Adicionar token", "add_begin"), button("❌ Remover token", "remove_menu")],
+                                [button("◀️ Voltar", "menu")]]}
+
+
+def back_markup(callback: str = "menu") -> dict[str, Any]:
+    return {"inline_keyboard": [[button("◀️ Voltar", callback)]]}
+
+
+def token_details_markup(pair: dict[str, Any], address: str, back: str = "price_menu") -> dict[str, Any]:
+    lookup_id = token_callback_id(address)
+    PRICE_LOOKUPS[lookup_id] = address
+    if len(PRICE_LOOKUPS) > 500:
+        PRICE_LOOKUPS.pop(next(iter(PRICE_LOOKUPS)))
+    origin = {"watch_list": "l", "price_menu": "p", "alerts": "a"}.get(back, "d")
+    rows = [[button("🔄 Atualizar", f"u:{lookup_id}:{origin}"),
+             button("◀️ Voltar", back)]]
+    links = pair_links_markup(pair)
+    urls = (links or {}).get("inline_keyboard", [[]])[0]
+    if urls:
+        urls[0] = {**urls[0], "text": "📊 Gráfico"}
+        rows.insert(0, urls)
+    return {"inline_keyboard": rows}
 
 
 def price_menu_markup(state: dict[str, Any], chat_id: int | str, page: int = 0) -> tuple[str, dict[str, Any]]:
     entries = watch_entries(state, chat_id)
     if not entries:
-        return ("📊 ESCOLHA O TOKEN\n\nVocê ainda não está monitorando tokens. Adicione um endereço para começar.",
-                {"inline_keyboard": [[button("➕ Adicionar token", "add_begin")]]})
+        return ("📊 CONSULTAR PREÇO\n\nSua lista ainda está vazia.",
+                {"inline_keyboard": [[button("➕ Adicionar token", "add_begin")], [button("◀️ Voltar", "menu")]]})
     page_size = 10
     page = max(0, min(page, (len(entries) - 1) // page_size))
     start = page * page_size
@@ -554,7 +592,7 @@ def price_menu_markup(state: dict[str, Any], chat_id: int | str, page: int = 0) 
     for entry in entries[start:start + page_size]:
         symbol = entry.get("symbol") or entry.get("name") or "TOKEN"
         rows.append([button(f"{change_icon(entry.get('last_change_24h'))} {symbol}"[:64], f"p:{token_callback_id(entry['address'])}")])
-    rows.append([button("🔄 Atualizar lista", f"p_refresh:{page}")])
+    rows.append([button("🔄 Atualizar", f"p_refresh:{page}")])
     nav = []
     if page > 0:
         nav.append(button("⬅️", f"p_page:{page - 1}"))
@@ -562,13 +600,14 @@ def price_menu_markup(state: dict[str, Any], chat_id: int | str, page: int = 0) 
         nav.append(button("➡️", f"p_page:{page + 1}"))
     if nav:
         rows.append(nav)
-    return "📊 ESCOLHA O TOKEN\n\n👇 Selecione uma moeda para consultar:", {"inline_keyboard": rows}
+    rows.append([button("◀️ Voltar", "menu")])
+    return "📊 CONSULTAR PREÇO\n\nSelecione um token:", {"inline_keyboard": rows}
 
 
 def remove_menu_markup(state: dict[str, Any], chat_id: int | str, page: int = 0) -> tuple[str, dict[str, Any]]:
     entries = watch_entries(state, chat_id)
     if not entries:
-        return "❌ REMOVER TOKEN\n\nVocê ainda não está monitorando nenhum token.", {"inline_keyboard": [[button("📋 Minha lista", "watch_list")]]}
+        return "❌ REMOVER TOKEN\n\nSua lista ainda está vazia.", {"inline_keyboard": [[button("◀️ Voltar", "alerts")]]}
     page_size = 10
     page = max(0, min(page, (len(entries) - 1) // page_size))
     start = page * page_size
@@ -583,13 +622,14 @@ def remove_menu_markup(state: dict[str, Any], chat_id: int | str, page: int = 0)
         nav.append(button("➡️", f"r_page:{page + 1}"))
     if nav:
         rows.append(nav)
+    rows.append([button("◀️ Voltar", "alerts")])
     return "❌ REMOVER TOKEN\n\nSelecione o token que deseja remover:", {"inline_keyboard": rows}
 
 
 def start_text() -> str:
-    return ("🚀 0x_LSR CRYPTO ALERTS\n\n━━━━━━━━━━━━━━━━━━━━\n\n"
-            "Seu terminal rápido de tokens Solana.\n\n"
-            "📊 Consultar preços\n🔔 Monitorar tokens\n📋 Gerenciar sua lista\n\n━━━━━━━━━━━━━━━━━━━━")
+    return ("🚀 0x_LSR CRYPTO ALERTS\n\nSeu painel de tokens Solana\n\n"
+            "━━━━━━━━━━━━━━━━━━━━\n\n"
+            "💰 Consultar preço\n🔔 Meus alertas\n➕ Adicionar token\n📋 Minha lista\n\nℹ️ Ajuda")
 
 
 def change_icon(value: Any) -> str:
@@ -597,21 +637,54 @@ def change_icon(value: Any) -> str:
     return text.split(" ", 1)[0] if text.startswith(("🟢", "🔴", "⚪")) else "⚪"
 
 
-def watch_list_text(entries: list[dict[str, Any]], threshold: float) -> str:
+def watch_list_text(entries: list[dict[str, Any]], threshold: float, page: int = 0) -> str:
     if not entries:
-        return "📋 MEUS TOKENS\n\nVocê ainda não está monitorando nenhum token."
+        return "📋 MINHA LISTA\n\nSua lista ainda está vazia."
+    page_size = 10
+    page = max(0, min(page, (len(entries) - 1) // page_size))
     rows = []
-    for index, entry in enumerate(entries, 1):
+    for entry in entries[page * page_size:(page + 1) * page_size]:
         name = entry.get("name") or entry.get("symbol") or "TOKEN"
         symbol = entry.get("symbol")
         if symbol and symbol.casefold() != name.casefold():
             name = f"{name} ({symbol})"
-        cap = entry.get("market_cap")
-        cap_label = "MC" if cap is not None else "FDV"
-        cap_value = cap if cap is not None else entry.get("fdv")
-        change = entry.get("last_change_24h")
-        rows.append(f"{change_icon(change)} {index}. {name}\n💰 {money(entry.get('last_price'))}\n{percent(change)} · 💎 {cap_label} {compact(cap_value)}\nEndereço: {entry['address']} · Alerta: ±{threshold:g}%")
-    return "📋 MEUS TOKENS\n\n" + "\n\n".join(rows)
+        rows.append(f"{change_icon(entry.get('last_change_24h'))} {name}")
+    return "📋 MINHA LISTA\n\n" + "\n".join(rows)
+
+
+def alerts_text(entries: list[dict[str, Any]], threshold: float) -> str:
+    if not entries:
+        return "🔔 MEUS ALERTAS\n\nAinda não há tokens na sua lista."
+    rows = []
+    for entry in entries:
+        name = entry.get("symbol") or entry.get("name") or "TOKEN"
+        rows.append(f"{change_icon(entry.get('last_change_24h'))} {name}\n⚡ Limite: ±{threshold:g}%")
+    return "🔔 MEUS ALERTAS\n\nVocê está acompanhando:\n\n" + "\n\n".join(rows)
+
+
+def token_buttons(entries: list[dict[str, Any]], action: str = "l", page: int = 0,
+                  navigation_action: str | None = None) -> dict[str, Any]:
+    page_size = 10
+    page = max(0, min(page, (len(entries) - 1) // page_size)) if entries else 0
+    start = page * page_size
+    rows = [[button(f"{change_icon(entry.get('last_change_24h'))} {entry.get('symbol') or entry.get('name') or 'TOKEN'}"[:64],
+                    f"{action}:{token_callback_id(entry['address'])}")] for entry in entries[start:start + page_size]]
+    navigation = []
+    navigation_action = navigation_action or action
+    if page:
+        navigation.append(button("⬅️ Anterior", f"{navigation_action}_page:{page - 1}"))
+    if start + page_size < len(entries):
+        navigation.append(button("Próxima ➡️", f"{navigation_action}_page:{page + 1}"))
+    if navigation:
+        rows.append(navigation)
+    return {"inline_keyboard": rows}
+
+
+def alerts_markup(entries: list[dict[str, Any]], page: int = 0) -> dict[str, Any]:
+    rows = token_buttons(entries, "l", page, "a")["inline_keyboard"]
+    rows.extend([[button("➕ Adicionar", "add_begin"), button("❌ Remover", "remove_menu")],
+                 [button("◀️ Voltar", "menu")]])
+    return {"inline_keyboard": rows}
 
 
 def save_pair_to_watch(state: dict[str, Any], address: str, chat_id: int | str,
@@ -637,22 +710,31 @@ def save_pair_to_watch(state: dict[str, Any], address: str, chat_id: int | str,
 
 
 def help_text() -> str:
-    return ("Comandos disponíveis:\n/price — escolher um token monitorado\n/price <endereço> — consultar diretamente (ou envie só o endereço)\n"
-        "/watch <endereço> — monitorar · /monitorar · /adicionar\n/unwatch <endereço> — remover · /remover\n"
-        "/list — ver seus tokens · /lista\n/help — mostrar ajuda\n\n"
-        "Os alertas usam o percentual configurado e respeitam o cooldown.")
+    return ("ℹ️ AJUDA\n\n🚀 Este bot permite:\n\n"
+        "💰 Consultar preços de tokens Solana\n🔔 Criar alertas de variação\n"
+        "📋 Gerenciar sua lista de tokens\n📊 Acompanhar dados de mercado\n\n"
+        "Como usar:\n\n1️⃣ Toque em \"Consultar preço\"\n2️⃣ Escolha um token\n"
+        "3️⃣ Para adicionar outro, toque em \"Adicionar token\"\n\n"
+        "Comandos disponíveis:\n/start — abrir o menu\n/price — consultar preço\n"
+        "/list — minha lista\n/watch — adicionar alerta\n/unwatch — remover alerta\n/help — ajuda\n\n"
+        "Os comandos ficam apenas como referência técnica.")
 
 
 MARKET_UNAVAILABLE = "Não consegui consultar o preço agora. As fontes de mercado estão temporariamente indisponíveis. Tente novamente em alguns segundos."
 
 
-def begin_add_flow(state: dict[str, Any], token: str, chat_id: int | str) -> None:
+def begin_add_flow(state: dict[str, Any], token: str, chat_id: int | str,
+                   message: dict[str, Any] | None = None) -> None:
     chat_key = str(chat_id)
     with STATE_LOCK:
         state.setdefault("awaiting_add", {})[chat_key] = time.time()
         state.setdefault("pending_add", {}).pop(chat_key, None)
         save_state(state)
-    send_message(token, chat_id, "➕ ADICIONAR TOKEN\n\nEnvie o endereço do token Solana que deseja monitorar.")
+    text = "➕ ADICIONAR TOKEN\n\nEnvie o endereço do token Solana que deseja adicionar."
+    if message is not None:
+        show_callback_screen(token, chat_id, message, text, back_markup())
+    else:
+        send_message(token, chat_id, text, back_markup())
 
 
 def preview_add_flow(state: dict[str, Any], token: str, chat_id: int | str, address: str) -> None:
@@ -667,7 +749,8 @@ def preview_add_flow(state: dict[str, Any], token: str, chat_id: int | str, addr
     with STATE_LOCK:
         state.setdefault("pending_add", {})[chat_key] = {"address": address, "pair": pair, "timestamp": time.time()}
         save_state(state)
-    markup = {"inline_keyboard": [[button("✅ Monitorar", f"add_yes:{token_callback_id(address)}"), button("❌ Cancelar", "cancel_add")]]}
+    markup = {"inline_keyboard": [[button("✅ Adicionar", f"add_yes:{token_callback_id(address)}"), button("❌ Cancelar", "cancel_add")],
+                                   [button("◀️ Voltar", "menu")]]}
     send_message(token, chat_id, "🟢 TOKEN ENCONTRADO\n\n" + pair_summary(pair), markup)
 
 
@@ -676,27 +759,32 @@ def send_watch_list(token: str, chat_id: int | str, state: dict[str, Any], thres
     if not entries:
         send_message(token, chat_id, watch_list_text([], threshold), list_actions_markup())
         return
-    heading = "📋 MEUS TOKENS\n\n"
-    chunks: list[str] = []
-    current = heading
-    for entry in entries:
-        name = entry.get("name") or entry.get("symbol") or "TOKEN"
-        symbol = entry.get("symbol")
-        label = f"{name} ({symbol})" if symbol and symbol.casefold() != name.casefold() else name
-        cap = entry.get("market_cap")
-        cap_label = "MC" if cap is not None else "FDV"
-        cap_value = cap if cap is not None else entry.get("fdv")
-        row = (f"{change_icon(entry.get('last_change_24h'))} {label}\n💰 {money(entry.get('last_price'))} · {percent(entry.get('last_change_24h'))}"
-               f"\n💎 {cap_label} {compact(cap_value)}\nEndereço: {entry['address']} · Alerta: ±{threshold:g}%")
-        candidate = current + ("\n\n" if current != heading else "") + row
-        if len(candidate) > 3500 and current != heading:
-            chunks.append(current)
-            current = heading + row
-        else:
-            current = candidate
-    chunks.append(current)
-    for index, chunk in enumerate(chunks):
-        send_message(token, chat_id, chunk, list_actions_markup() if index == len(chunks) - 1 else None)
+    markup = token_buttons(entries)
+    markup["inline_keyboard"].extend(list_actions_markup()["inline_keyboard"])
+    send_message(token, chat_id, watch_list_text(entries, threshold), markup)
+
+
+def send_alerts(token: str, chat_id: int | str, state: dict[str, Any], threshold: float) -> None:
+    entries = watch_entries(state, chat_id)
+    send_message(token, chat_id, alerts_text(entries, threshold), alerts_markup(entries))
+
+
+def show_callback_screen(token: str, chat_id: int | str, message: dict[str, Any], text: str,
+                         markup: dict[str, Any] | None = None) -> None:
+    message_id = message.get("message_id")
+    if message_id is None:
+        send_message(token, chat_id, text, markup)
+        return
+    try:
+        edit_message(token, chat_id, message_id, text, markup)
+    except TelegramError as exc:
+        error = str(exc).casefold()
+        if "message is not modified" in error:
+            return
+        if "message to edit not found" in error or "message can't be edited" in error:
+            send_message(token, chat_id, text, markup)
+            return
+        raise
 
 
 def handle_update(update: dict[str, Any], state: dict[str, Any], token: str, threshold: float,
@@ -738,7 +826,7 @@ def handle_update(update: dict[str, Any], state: dict[str, Any], token: str, thr
             if command == "/start":
                 send_message(token, chat_id, start_text(), main_menu_markup())
             elif command == "/help":
-                send_message(token, chat_id, help_text(), main_menu_markup())
+                send_message(token, chat_id, help_text(), back_markup())
             elif command == "/price":
                 if not arg:
                     text, markup = price_menu_markup(state, chat_id)
@@ -749,7 +837,8 @@ def handle_update(update: dict[str, Any], state: dict[str, Any], token: str, thr
                     send_message(token, chat_id, "Endereço Solana inválido. Confira o Base58 e tente novamente.")
                 else:
                     pair = get_market_data(arg)
-                    send_message(token, chat_id, pair_summary(pair) if pair else "Token Solana não encontrado nas fontes de mercado.", pair_links_markup(pair) if pair else None)
+                    send_message(token, chat_id, pair_summary(pair) if pair else "Token Solana não encontrado nas fontes de mercado.",
+                                 token_details_markup(pair, arg, "menu") if pair else None)
             elif command == "/watch":
                 if not arg:
                     begin_add_flow(state, token, chat_id)
@@ -820,53 +909,105 @@ def handle_callback_update(update: dict[str, Any], state: dict[str, Any], token:
     chat_id = chat["id"]
     chat_key = str(chat_id)
     data = str(query.get("data") or "")
+    callback_message = message
     with STATE_LOCK:
         state.setdefault("awaiting_add", {})
         state.setdefault("pending_add", {})
     LOG.info("Callback recebido: chat_id=%s user_id=%s ação=%s", chat_id, user_id or "indisponível", data.partition(":")[0])
     try:
-        if data == "price_menu" or data.startswith(("p_page:", "p_refresh:")):
+        if data in {"menu", "back"}:
+            with STATE_LOCK:
+                state["awaiting_add"].pop(chat_key, None)
+                state["pending_add"].pop(chat_key, None)
+                save_state(state)
+            show_callback_screen(token, chat_id, callback_message, start_text(), main_menu_markup())
+        elif data == "price_menu" or data.startswith(("p_page:", "p_refresh:")):
             try:
                 page = int(data.split(":", 1)[1]) if ":" in data else 0
             except ValueError:
                 page = 0
             text, markup = price_menu_markup(state, chat_id, page)
-            send_message(token, chat_id, text, markup)
+            show_callback_screen(token, chat_id, callback_message, text, markup)
         elif data == "watch_list":
-            send_watch_list(token, chat_id, state, threshold)
+            entries = watch_entries(state, chat_id)
+            markup = token_buttons(entries)
+            markup["inline_keyboard"].extend(list_actions_markup()["inline_keyboard"])
+            show_callback_screen(token, chat_id, callback_message, watch_list_text(entries, threshold), markup)
+        elif data.startswith("l_page:"):
+            try:
+                page = max(0, int(data.split(":", 1)[1]))
+            except ValueError:
+                page = 0
+            entries = watch_entries(state, chat_id)
+            markup = token_buttons(entries, "l", page)
+            markup["inline_keyboard"].extend(list_actions_markup()["inline_keyboard"])
+            show_callback_screen(token, chat_id, callback_message, watch_list_text(entries, threshold, page), markup)
+        elif data == "alerts" or data.startswith("a_page:"):
+            try:
+                page = max(0, int(data.split(":", 1)[1])) if ":" in data else 0
+            except ValueError:
+                page = 0
+            entries = watch_entries(state, chat_id)
+            alert_text = alerts_text(entries, threshold)
+            if entries:
+                page = max(0, min(page, (len(entries) - 1) // 10))
+                names = [f"{change_icon(entry.get('last_change_24h'))} {entry.get('symbol') or entry.get('name') or 'TOKEN'}\n⚡ Limite: ±{threshold:g}%"
+                         for entry in entries[page * 10:(page + 1) * 10]]
+                alert_text = "🔔 MEUS ALERTAS\n\nVocê está acompanhando:\n\n" + "\n\n".join(names)
+            show_callback_screen(token, chat_id, callback_message, alert_text, alerts_markup(entries, page))
         elif data == "help":
-            send_message(token, chat_id, help_text(), main_menu_markup())
+            show_callback_screen(token, chat_id, callback_message, help_text(), back_markup())
         elif data == "add_begin":
-            begin_add_flow(state, token, chat_id)
+            begin_add_flow(state, token, chat_id, callback_message)
         elif data == "remove_menu" or data.startswith("r_page:"):
             try:
                 page = int(data.split(":", 1)[1]) if ":" in data else 0
             except ValueError:
                 page = 0
             text, markup = remove_menu_markup(state, chat_id, page)
-            send_message(token, chat_id, text, markup)
-        elif data.startswith("p:"):
+            show_callback_screen(token, chat_id, callback_message, text, markup)
+        elif data.startswith(("p:", "l:")):
+            action = data[0]
             entry = watch_for_callback(state, chat_id, data[2:])
             if not entry:
-                send_message(token, chat_id, "Esse token não está mais na lista deste chat.")
+                show_callback_screen(token, chat_id, callback_message, "Esse token não está mais na sua lista.", back_markup("watch_list" if action == "l" else "price_menu"))
                 return
             pair = get_market_data(entry["address"])
             if pair:
-                send_message(token, chat_id, pair_summary(pair), pair_links_markup(pair))
+                back = "watch_list" if action == "l" else "price_menu"
+                show_callback_screen(token, chat_id, callback_message, pair_summary(pair), token_details_markup(pair, entry["address"], back))
             else:
-                send_message(token, chat_id, "Token não encontrado nas fontes de mercado.")
+                show_callback_screen(token, chat_id, callback_message, "Token não encontrado nas fontes de mercado.", back_markup("watch_list" if action == "l" else "price_menu"))
+        elif data.startswith("u:"):
+            _, callback_key, origin = (data.split(":", 2) + ["p"])[:3]
+            if origin == "d":
+                address = PRICE_LOOKUPS.get(callback_key)
+                back = "menu"
+            else:
+                entry = watch_for_callback(state, chat_id, callback_key)
+                address = entry.get("address") if entry else None
+                back = {"l": "watch_list", "p": "price_menu", "a": "alerts"}.get(origin, "price_menu")
+            if not address:
+                show_callback_screen(token, chat_id, callback_message, "Esse token não está mais na sua lista.", back_markup(back))
+                return
+            pair = get_market_data(address)
+            if pair:
+                show_callback_screen(token, chat_id, callback_message, pair_summary(pair), token_details_markup(pair, address, back))
+            else:
+                show_callback_screen(token, chat_id, callback_message, MARKET_UNAVAILABLE, back_markup(back))
         elif data.startswith("r:"):
             entry = watch_for_callback(state, chat_id, data[2:])
             if not entry:
-                send_message(token, chat_id, "Esse token não está mais na lista deste chat.")
+                show_callback_screen(token, chat_id, callback_message, "Esse token não está mais na sua lista.", back_markup("alerts"))
                 return
             label = entry.get("name") or entry.get("symbol") or "este token"
             markup = {"inline_keyboard": [[button("✅ Sim, remover", f"ry:{token_callback_id(entry['address'])}"), button("❌ Cancelar", "cancel_remove")]]}
-            send_message(token, chat_id, f"Remover {label} do monitoramento?", markup)
+            markup["inline_keyboard"].append([button("◀️ Voltar", "remove_menu")])
+            show_callback_screen(token, chat_id, callback_message, f"Deseja remover {label} dos seus alertas?", markup)
         elif data.startswith("ry:"):
             entry = watch_for_callback(state, chat_id, data[3:])
             if not entry:
-                send_message(token, chat_id, "Esse token não está mais na lista deste chat.")
+                show_callback_screen(token, chat_id, callback_message, "Esse token não está mais na sua lista.", back_markup("alerts"))
                 return
             address = entry["address"]
             with STATE_LOCK:
@@ -874,16 +1015,16 @@ def handle_callback_update(update: dict[str, Any], state: dict[str, Any], token:
                 if not entry["subscribers"]:
                     state["watches"].pop(address, None)
                 save_state(state)
-            send_message(token, chat_id, "✅ Token removido do monitoramento.")
+            show_callback_screen(token, chat_id, callback_message, "✅ Token removido dos seus alertas.", back_markup("alerts"))
         elif data.startswith("add_yes:"):
             with STATE_LOCK:
                 pending = dict(state["pending_add"].get(chat_key) or {})
             if not pending or token_callback_id(pending.get("address", "")) != data.split(":", 1)[1]:
-                send_message(token, chat_id, "A confirmação expirou. Inicie novamente pelo menu Adicionar token.")
+                show_callback_screen(token, chat_id, callback_message, "A confirmação expirou. Inicie novamente em Adicionar token.", back_markup())
                 return
             pair = get_market_data(pending["address"])
             if not pair:
-                send_message(token, chat_id, "Token não encontrado nas fontes de mercado.")
+                show_callback_screen(token, chat_id, callback_message, "Token não encontrado nas fontes de mercado.", back_markup())
                 return
             entry = save_pair_to_watch(state, pending["address"], chat_id, pair)
             with STATE_LOCK:
@@ -891,26 +1032,39 @@ def handle_callback_update(update: dict[str, Any], state: dict[str, Any], token:
                 state["awaiting_add"].pop(chat_key, None)
                 save_state(state)
             LOG.info("Token adicionado pelo menu: chat_id=%s user_id=%s address=%s", chat_id, user_id or "indisponível", entry["address"])
-            send_message(token, chat_id, "✅ MONITORAMENTO ATIVADO\n\n" + pair_summary(pair), pair_links_markup(pair))
+            show_callback_screen(token, chat_id, callback_message, "✅ Adicionado aos seus alertas.\n\n" + pair_summary(pair),
+                                 token_details_markup(pair, pending["address"], "alerts"))
         elif data in {"cancel_add", "cancel_remove"}:
             if data == "cancel_add":
                 with STATE_LOCK:
                     state["pending_add"].pop(chat_key, None)
                     state["awaiting_add"].pop(chat_key, None)
                     save_state(state)
-            send_message(token, chat_id, "Operação cancelada.")
+            if data == "cancel_remove":
+                entries = watch_entries(state, chat_id)
+                show_callback_screen(token, chat_id, callback_message, alerts_text(entries, threshold), alerts_markup(entries))
+            else:
+                show_callback_screen(token, chat_id, callback_message, start_text(), main_menu_markup())
         else:
-            send_message(token, chat_id, "Essa ação não é reconhecida. Use /start para abrir o menu.")
+            show_callback_screen(token, chat_id, callback_message, "Essa ação não é reconhecida.", back_markup())
     except TelegramError:
         raise
     except MarketDataError as exc:
         LOG.warning("Consulta a fontes de mercado falhou no callback: %s", exc)
-        send_message(token, chat_id, MARKET_UNAVAILABLE)
+        if data.startswith("l:") or data.endswith(":l"):
+            back = "watch_list"
+        elif data.startswith("p:") or data.endswith(":p"):
+            back = "price_menu"
+        elif data.endswith(":a"):
+            back = "alerts"
+        else:
+            back = "menu"
+        show_callback_screen(token, chat_id, callback_message, MARKET_UNAVAILABLE, back_markup(back))
     except BotError as exc:
-        send_message(token, chat_id, str(exc))
+        show_callback_screen(token, chat_id, callback_message, str(exc), back_markup())
     except Exception:
         LOG.exception("Falha ao processar callback %s no chat %s", data.partition(":")[0], chat_id)
-        send_message(token, chat_id, "Não consegui concluir essa ação agora. Tente novamente.")
+        show_callback_screen(token, chat_id, callback_message, "Não consegui concluir essa ação agora. Tente novamente.", back_markup())
 
 
 def check_prices(state: dict[str, Any], token: str, threshold: float, cooldown: float) -> None:
@@ -1040,6 +1194,12 @@ def main() -> int:
     while not STOP.is_set():
         try:
             validate_telegram(token)
+            try:
+                configure_bot_commands(token)
+            except TelegramUnauthorized:
+                raise
+            except TelegramError as exc:
+                LOG.warning("Não foi possível atualizar o menu de comandos do Telegram: %s", exc)
             break
         except TelegramUnauthorized as exc:
             LOG.error("TELEGRAM_BOT_TOKEN inválido ou rejeitado pelo Telegram. Confira/atualize o Secret TELEGRAM_BOT_TOKEN no GitHub. Detalhe seguro: %s", exc)

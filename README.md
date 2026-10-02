@@ -4,12 +4,14 @@ Bot de alertas Telegram para tokens Solana, usando primeiro a API pública do [G
 
 ## Comandos e menus interativos
 
-- `/start` e `/help`: instruções.
-- `/start`: menu principal com botões inline para preço, alertas, adicionar token, lista e ajuda.
+- `/start`: menu principal em português com botões para consultar preço, alertas, adicionar token, lista e ajuda.
+- `/help`: guia rápido em português e comandos de compatibilidade.
 - `/price` (`/preço`, `/preco`): abre o seletor inline dos tokens monitorados neste chat. `/price <endereço>` e um endereço enviado sozinho consultam diretamente.
 - `/watch <endereço>` (`/monitorar`, `/adicionar`): monitora imediatamente. Sem endereço, inicia o fluxo guiado com confirmação.
 - `/unwatch <endereço>` (`/remover`): remove diretamente. Sem endereço, abre o seletor de remoção com confirmação.
-- `/list` (`/lista`): lista os tokens deste chat e oferece botões para ver preços, adicionar ou remover.
+- `/list` (`/lista`): mostra os tokens deste chat como botões; toque em um token para abrir os dados completos.
+
+Os botões de navegação editam a mensagem atual, confirmam callbacks imediatamente e usam identificadores curtos, sem endereços completos nos dados do callback. A lista é paginada em grupos de dez tokens. O menu de comandos nativo do Telegram é configurado na inicialização com `/start`, `/price`, `/list`, `/watch`, `/unwatch` e `/help`, em português; aliases continuam aceitos como compatibilidade, sem aparecer no menu.
 
 O limiar é configurado por `ALERT_THRESHOLD_PERCENT` (padrão 10%) e o intervalo mínimo entre alertas por token por `ALERT_COOLDOWN_MINUTES` (padrão 30). A verificação de mercado ocorre a cada minuto por padrão e só consulta as APIs quando há tokens acompanhados. A API de token do GeckoTerminal inclui os pools principais; o monitor consulta em lotes de até 30 endereços. A variação de 24h é lida do pool com maior liquidez. Se a consulta falhar, o bot tenta DexScreener. A indisponibilidade das duas fontes não interrompe o polling do Telegram. Endereços são validados como chaves públicas Solana Base58 de 32 bytes.
 
