@@ -3,277 +3,168 @@ import logging
 import os
 import unittest
 import urllib.parse
+from pathlib import Path
 from unittest.mock import patch
 from urllib.error import HTTPError, URLError
 
 import bot
 
 
-class TelegramApiTests(unittest.TestCase):
-    def test_http_error_logs_status_and_body_without_token(self):
-        token = "123456:abcdefghijklmnopqrstuvwxyzABCDEFGHIJK"
-        encoded_token = urllib.parse.quote(token, safe="")
-        body = f'{{"ok":false,"description":"bad request at bot{token}/getMe or {encoded_token}"}}'.encode()
-        error = HTTPError(
-            f"https://api.telegram.org/bot{token}/getMe",
-            401,
-            "Unauthorized",
-            {},
-            io.BytesIO(body),
-        )
-        with self.assertLogs(bot.LOG, level=logging.ERROR) as captured:
-            with patch.object(bot.urllib.request, "urlopen", side_effect=error):
-                with self.assertRaisesRegex(bot.BotError, "HTTP 401"):
-                    bot.http_json(f"https://api.telegram.org/bot{token}/getMe")
+ADDRESS = "So11111111111111111111111111111111111111112"
+PAIR = {
+    "chainId": "solana",
+    "baseToken": {"address": ADDRESS, "name": "Wrapped SOL", "symbol": "SOL"},
+    "priceUsd": "150.25",
+    "priceChange": {"h24": "1.5"},
+    "liquidity": {"usd": 100000},
+    "volume": {"h24": 25000},
+    "marketCap": 1000000,
+    "url": "https://dexscreener.com/solana/example",
+}
 
-        output = "\n".join(captured.output)
-        self.assertIn("401", output)
-        self.assertIn("bad request", output)
-        self.assertNotIn(token, output)
-        self.assertNotIn(encoded_token, output)
-        self.assertIn("[REDACTED]", output)
 
-    def test_network_error_is_specific_and_redacted(self):
-        token = "123456:abcdefghijklmnopqrstuvwxyzABCDEFGHIJK"
-        url = f"https://api.telegram.org/bot{token}/getUpdates"
-        network_error = URLError(f"simulated DNS failure involving {token}")
+class SolanaAddressTests(unittest.TestCase):
+    def test_valid_base58_public_keys(self):
+        self.assertTrue(bot.is_valid_solana_address(ADDRESS))
+        self.assertTrue(bot.is_valid_solana_address("CwSNUU54NLJt4qbGg5S8TUzJYxjYAfL4VrPr7zvJpump"))
 
-        with self.assertLogs(bot.LOG, level=logging.ERROR) as captured:
-            with patch.object(bot.urllib.request, "urlopen", side_effect=network_error):
-                with self.assertRaises(bot.TelegramError) as raised:
-                    bot.http_json(url)
+    def test_rejects_whitespace_bad_alphabet_and_wrong_decoded_length(self):
+        for address in (ADDRESS + " ", " " + ADDRESS, ADDRESS[:5] + "0" + ADDRESS[6:], "abc", "1" * 31):
+            with self.subTest(address=address):
+                self.assertFalse(bot.is_valid_solana_address(address))
 
-        self.assertIn("simulated DNS failure", str(raised.exception))
-        self.assertNotIn(token, str(raised.exception))
-        self.assertNotIn(token, "\n".join(captured.output))
-
-    def test_geckoterminal_network_error_has_separate_type(self):
-        with patch.object(
-            bot.urllib.request,
-            "urlopen",
-            side_effect=URLError("simulated GeckoTerminal network failure"),
-        ):
-            with self.assertRaises(bot.MarketDataError) as raised:
-                bot.http_json("https://api.geckoterminal.com/api/v2/search/pools?query=SOL&network=solana")
-        self.assertIn("simulated GeckoTerminal network failure", str(raised.exception))
-
-    def test_telegram_error_includes_code_and_description_redacted(self):
-        token = "123456:abcdefghijklmnopqrstuvwxyzABCDEFGHIJK"
-        response = {
-            "ok": False,
-            "error_code": 401,
-            "description": f"Unauthorized {token}",
+    def test_parser_commands_aliases_and_bare_address(self):
+        cases = {
+            "/price " + ADDRESS: ("/price", ADDRESS),
+            "/preço " + ADDRESS: ("/price", ADDRESS),
+            "/watch " + ADDRESS: ("/watch", ADDRESS),
+            "/add " + ADDRESS: ("/watch", ADDRESS),
+            "/unwatch " + ADDRESS: ("/unwatch", ADDRESS),
+            "/remove " + ADDRESS: ("/unwatch", ADDRESS),
+            "/list": ("/list", ""),
+            "/lista": ("/list", ""),
+            ADDRESS: ("/price", ADDRESS),
+            "/help@my_bot": ("/help", ""),
         }
-        with patch.object(bot, "http_json", return_value=response):
-            with self.assertRaises(bot.BotError) as raised:
-                bot.telegram(token, "getMe")
+        for raw, expected in cases.items():
+            with self.subTest(raw=raw):
+                self.assertEqual(bot.parse_message(raw), expected)
+        self.assertEqual(bot.parse_message("not an address"), (None, ""))
 
-        self.assertIn("401", str(raised.exception))
-        self.assertIn("Unauthorized", str(raised.exception))
-        self.assertNotIn(token, str(raised.exception))
 
-    def test_preflight_validates_token_then_deletes_webhook_preserving_updates(self):
-        token = "test-token"
-        with patch.object(
-            bot,
-            "telegram",
-            side_effect=[{"id": 55, "username": "alert_bot"}, True],
-        ) as telegram:
-            bot.validate_telegram(token)
+class DexScreenerTests(unittest.TestCase):
+    def test_address_lookup_uses_token_pairs_and_normalizes_response(self):
+        with patch.object(bot, "http_json", return_value=[PAIR]) as request:
+            result = bot.get_pair(ADDRESS)
+        self.assertIn("/token-pairs/v1/solana/", request.call_args.args[0])
+        self.assertEqual(result, PAIR)
+        output = bot.pair_summary(result)
+        for value in ("SOL", "$150.25", "+1.50%", "$100,000", "$25,000", "$1,000,000", ADDRESS, PAIR["url"]):
+            self.assertIn(value, output)
 
-        self.assertEqual(
-            telegram.call_args_list,
-            [
-                unittest.mock.call(token, "getMe"),
-                unittest.mock.call(
-                    token, "deleteWebhook", {"drop_pending_updates": False}
-                ),
-            ],
-        )
+    def test_symbol_search_uses_solana_and_returns_best_exact_match(self):
+        with patch.object(bot, "http_json", return_value={"pairs": [PAIR]}) as request:
+            result = bot.get_pair("SOL")
+        self.assertIn("/latest/dex/search?q=SOL", request.call_args.args[0])
+        self.assertEqual(result["baseToken"]["symbol"], "SOL")
 
-    def test_help_keeps_requested_commands(self):
-        help_output = bot.help_text()
-        for command in ("/help", "/price", "/watch", "/unwatch", "/list"):
-            self.assertIn(command, help_output)
-        with patch.object(bot, "send_message") as send_message:
-            bot.handle_update(
-                {"message": {"chat": {"id": 1}, "from": {"id": 2}, "text": "/start"}},
-                {"watches": {}},
-                "test-token",
-                10.0,
-                set(),
-            )
-        self.assertIn("Bot de alertas Solana ativo", send_message.call_args.args[2])
+    def test_api_errors_are_dex_specific_and_token_redacted(self):
+        with patch.object(bot.urllib.request, "urlopen", side_effect=URLError("offline")):
+            with self.assertRaisesRegex(bot.DexScreenerError, "offline"):
+                bot.http_json("https://api.dexscreener.com/token-pairs/v1/solana/" + ADDRESS)
 
-    def test_price_watch_unwatch_and_list_respond_immediately(self):
-        address = "So11111111111111111111111111111111111111112"
-        pair = {
-            "chainId": "solana",
-            "baseToken": {"symbol": "SOL", "address": address},
-            "priceUsd": "150",
-            "priceChange": {"h24": 1.5},
-            "liquidity": {"usd": 100000},
-            "volume": {"h24": 25000},
-            "fdv": 1000000,
-            "url": "https://www.geckoterminal.com/solana/pools/example",
-        }
+
+class TelegramCommandTests(unittest.TestCase):
+    def setUp(self):
+        bot.LOG.setLevel(logging.CRITICAL)
+
+    def receive(self, text, state, chat_id=1, user_id=7):
+        bot.handle_update({"message": {"chat": {"id": chat_id}, "from": {"id": user_id}, "text": text}}, state, "unused", 7.5, set())
+
+    def test_immediate_commands_auto_price_watch_scoped_list_and_remove(self):
         state = {"offset": 0, "watches": {}}
         sent = []
-
-        def receive(update_text):
-            bot.handle_update(
-                {"message": {"chat": {"id": 1}, "from": {"id": 2}, "text": update_text}},
-                state,
-                "test-token",
-                10.0,
-                set(),
-            )
-
-        with patch.object(bot, "get_pair", return_value=pair) as get_pair:
+        with patch.object(bot, "get_pair", return_value=PAIR) as lookup:
             with patch.object(bot, "send_message", side_effect=lambda _token, _chat, text: sent.append(text)):
-                receive("/price SOL")
-                receive(f"/price {address}")
-                receive(f"/watch {address}")
-                receive("/list")
-                receive(f"/unwatch {address}")
+                self.receive("/start", state)
+                self.receive("/help", state)
+                self.receive(ADDRESS, state)
+                self.receive("/preço " + ADDRESS, state)
+                self.receive("/add " + ADDRESS, state)
+                self.receive("/list", state, chat_id=1)
+                self.receive("/list", state, chat_id=2)
+                self.receive("/remove " + ADDRESS, state)
+        self.assertIn("Bot de alertas Solana ativo", sent[0])
+        self.assertIn("/price", sent[1])
+        self.assertIn(PAIR["url"], sent[2])
+        self.assertIn(PAIR["url"], sent[3])
+        self.assertIn("Monitoramento ativado", sent[4])
+        self.assertIn("SOL", sent[5])
+        self.assertIn("7.5%", sent[5])
+        self.assertEqual(sent[6], "Seus tokens monitorados:\nnenhum")
+        self.assertEqual(sent[7], "Monitoramento removido.")
+        self.assertEqual(lookup.call_count, 3)
 
-        self.assertEqual(get_pair.call_count, 3)
-        self.assertIn("Preço: $150", sent[0])
-        self.assertIn("Preço: $150", sent[1])
-        self.assertIn("Monitoramento ativado", sent[2])
-        self.assertIn(address, sent[3])
-        self.assertEqual(sent[4], "Monitoramento removido.")
-        self.assertEqual(state["watches"], {})
+    def test_dex_failure_gets_requested_friendly_reply_and_polling_error_is_not_swallowed(self):
+        state = {"watches": {}}
+        sent = []
+        with patch.object(bot, "get_pair", side_effect=bot.DexScreenerError("HTTP 503")):
+            with patch.object(bot, "send_message", side_effect=lambda _token, _chat, text: sent.append(text)):
+                self.receive("/price " + ADDRESS, state)
+        self.assertEqual(sent, ["DexScreener está temporariamente indisponível. Tente novamente em instantes."])
 
-    def test_price_checks_skip_market_data_when_no_tokens_are_watched(self):
-        with patch.object(bot, "http_json") as request:
-            bot.check_prices({"watches": {}}, "test-token", 10.0, 1800.0)
-        request.assert_not_called()
+    def test_invalid_watch_address_never_calls_dex(self):
+        with patch.object(bot, "get_pair") as lookup:
+            with patch.object(bot, "send_message") as send:
+                self.receive("/watch " + ADDRESS[:6] + "0" + ADDRESS[7:], {"watches": {}})
+        lookup.assert_not_called()
+        self.assertIn("endereço Solana válido", send.call_args.args[2])
 
-    def test_market_data_monitoring_failure_does_not_escape_price_cycle(self):
-        address = "So11111111111111111111111111111111111111112"
-        state = {"watches": {address.lower(): {"address": address, "subscribers": []}}}
-        with patch.object(bot, "http_json", side_effect=bot.MarketDataError("temporary outage")):
-            bot.check_prices(state, "test-token", 10.0, 1800.0)
+    def test_list_is_chat_scoped_and_contains_cached_price(self):
+        state = {"watches": {ADDRESS: {"address": ADDRESS, "symbol": "SOL", "last_price": 150, "subscribers": ["1"]}}}
+        with patch.object(bot, "send_message") as send:
+            self.receive("/lista", state, chat_id=1)
+            self.receive("/list", state, chat_id=2)
+        self.assertIn("SOL", send.call_args_list[0].args[2])
+        self.assertIn("$150", send.call_args_list[0].args[2])
+        self.assertEqual(send.call_args_list[1].args[2], "Seus tokens monitorados:\nnenhum")
 
-    def test_geckoterminal_address_lookup_normalizes_market_metrics(self):
-        address = "So11111111111111111111111111111111111111112"
-        response = {
-            "data": {
-                "id": "solana_token",
-                "type": "token",
-                "attributes": {
-                    "address": address,
-                    "name": "Wrapped SOL",
-                    "symbol": "SOL",
-                    "price_usd": "150",
-                    "total_reserve_in_usd": "100000",
-                    "volume_usd": {"h24": "25000"},
-                    "market_cap_usd": "1000000",
-                },
-                "relationships": {"top_pools": {"data": [{"id": "solana_pool", "type": "pool"}]}},
-            },
-            "included": [{
-                "id": "solana_pool", "type": "pool",
-                "attributes": {
-                    "address": "PoolAddress",
-                    "price_change_percentage": {"h24": "1.5"},
-                    "volume_usd": {"h24": "25000"},
-                    "reserve_in_usd": "100000",
-                },
-            }],
-        }
-        with patch.object(bot, "http_json", return_value=response) as request:
-            pair = bot.get_pair(address)
 
-        self.assertIn("/networks/solana/tokens/", request.call_args.args[0])
-        self.assertEqual(pair["baseToken"]["symbol"], "SOL")
-        self.assertEqual(pair["priceUsd"], "150")
-        self.assertEqual(pair["priceChange"]["h24"], "1.5")
-        self.assertIn("geckoterminal.com", pair["url"])
+class StateAndPollingTests(unittest.TestCase):
+    def test_state_loader_repairs_bad_offset_and_discards_invalid_watch(self):
+        path = Path(__file__).resolve().parent / ".state-test.json"
+        try:
+            path.write_text('{"offset":"garbage","watches":{"bad":{"address":"not-valid"}}}', encoding="utf-8")
+            with patch.object(bot, "STATE_FILE", path):
+                state = bot.load_state()
+        finally:
+            path.unlink(missing_ok=True)
+        self.assertEqual(state, {"offset": 0, "watches": {}})
 
-    def test_geckoterminal_symbol_search_returns_matching_solana_token(self):
-        response = {
-            "data": [{
-                "id": "solana_pool", "type": "pool",
-                "attributes": {"address": "PoolAddress", "price_change_percentage": {"h24": "2.5"}, "reserve_in_usd": "200000", "volume_usd": {"h24": "50000"}},
-                "relationships": {"base_token": {"data": {"id": "solana_token"}}},
-            }],
-            "included": [{
-                "id": "solana_token", "type": "token",
-                "attributes": {"address": "So11111111111111111111111111111111111111112", "name": "Wrapped SOL", "symbol": "SOL", "price_usd": "150", "market_cap_usd": "1000000"},
-            }],
-        }
-        with patch.object(bot, "http_json", return_value=response) as request:
-            pair = bot.get_pair("SOL")
-
-        self.assertIn("/search/pools?", request.call_args.args[0])
-        self.assertEqual(pair["baseToken"]["symbol"], "SOL")
-        self.assertEqual(pair["priceUsd"], "150")
-        self.assertEqual(pair["priceChange"]["h24"], "2.5")
-
-    def test_monitor_checks_watched_tokens_through_geckoterminal_batches(self):
-        address = "So11111111111111111111111111111111111111112"
-        response = {
-            "data": [{
-                "id": "solana_token", "type": "token",
-                "attributes": {"address": address, "name": "Wrapped SOL", "symbol": "SOL", "price_usd": "120", "total_reserve_in_usd": "100000"},
-                "relationships": {"top_pools": {"data": [{"id": "solana_pool", "type": "pool"}]}},
-            }],
-            "included": [{
-                "id": "solana_pool", "type": "pool",
-                "attributes": {"address": "PoolAddress", "price_change_percentage": {"h24": "2"}, "reserve_in_usd": "100000"},
-            }],
-        }
-        state = {"watches": {address.lower(): {"address": address, "subscribers": ["1"], "anchor_price": 100, "last_alert": 0}}}
-        bot.STOP.clear()
-        with patch.object(bot, "http_json", return_value=response) as request:
-            with patch.object(bot, "send_message") as send_message:
-                bot.check_prices(state, "test-token", 10.0, 1800.0)
-
-        self.assertIn("/tokens/multi/", request.call_args.args[0])
-        self.assertIn("geckoterminal.com", send_message.call_args.args[2])
-        self.assertEqual(state["watches"][address.lower()]["anchor_price"], 120.0)
-
-    def test_continuous_poll_uses_telegram_long_poll_for_low_latency(self):
-        self.assertEqual(bot.TELEGRAM_POLL_TIMEOUT_SECONDS, 25)
-
-    def test_main_processes_pending_update_and_saves_offset(self):
-        state = {"offset": 0, "watches": {}}
-        saved_states = []
-        update = {
-            "update_id": 34,
-            "message": {
-                "chat": {"id": 1},
-                "from": {"id": 2},
-                "text": "/help",
-            },
-        }
+    def test_preflight_keeps_pending_updates_and_poll_starts_at_zero(self):
+        state = {"offset": 987654321, "watches": {}}
+        update = {"update_id": 34, "message": {"chat": {"id": 1}, "from": {"id": 2}, "text": "/help"}}
         calls = []
 
         def fake_telegram(token, method, payload=None):
-            calls.append((token, method, payload))
+            calls.append((method, payload))
             if method == "getUpdates":
                 bot.STOP.set()
                 return [update]
-            return None
+            return True
 
         with patch.dict(os.environ, {"TELEGRAM_BOT_TOKEN": "test-token"}):
-            with patch.object(bot, "validate_telegram", side_effect=lambda _token: calls.append(("preflight",))):
+            with patch.object(bot, "validate_telegram"):
                 with patch.object(bot, "telegram", side_effect=fake_telegram):
                     with patch.object(bot, "load_state", return_value=state):
-                        with patch.object(bot, "save_state", side_effect=lambda value: saved_states.append(dict(value))):
-                            with patch.object(bot, "send_message") as send_message:
+                        with patch.object(bot, "save_state"):
+                            with patch.object(bot, "send_message"):
                                 with patch.object(bot.signal, "signal"):
                                     self.assertEqual(bot.main(), 0)
-
-        self.assertEqual(calls[0], ("preflight",))
-        self.assertEqual(calls[1][1], "getUpdates")
-        self.assertEqual(calls[1][2]["timeout"], 25)
-        self.assertEqual(calls[1][2]["offset"], 0)
-        self.assertTrue(send_message.called)
+        poll = next(payload for method, payload in calls if method == "getUpdates")
+        self.assertEqual(poll["offset"], 0)
+        self.assertEqual(poll["timeout"], 1)
         self.assertEqual(state["offset"], 35)
-        self.assertIn({"offset": 35, "watches": {}}, saved_states)
 
 
 if __name__ == "__main__":

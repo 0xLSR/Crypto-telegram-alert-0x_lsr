@@ -1,4 +1,4 @@
-"""Continuous Telegram crypto alert worker backed by Telegram and GeckoTerminal."""
+"""Continuous Telegram crypto alert worker backed by Telegram and DexScreener."""
 from __future__ import annotations
 
 import json
@@ -17,10 +17,10 @@ from pathlib import Path
 from typing import Any
 
 API_BASE = "https://api.telegram.org/bot{token}/{method}"
-GECKO_BASE = "https://api.geckoterminal.com/api/v2"
+DEX_BASE = "https://api.dexscreener.com"
 STATE_FILE = Path(os.getenv("BOT_STATE_FILE", "data/state.json"))
-TELEGRAM_POLL_TIMEOUT_SECONDS = 25
-TELEGRAM_REQUEST_TIMEOUT_SECONDS = 35
+TELEGRAM_POLL_TIMEOUT_SECONDS = 1
+TELEGRAM_REQUEST_TIMEOUT_SECONDS = 15
 API_REQUEST_TIMEOUT_SECONDS = 15
 PRICE_CHECK_SECONDS = max(15, int(os.getenv("PRICE_CHECK_SECONDS", "60")))
 MAX_WATCHES = 100
@@ -37,7 +37,7 @@ class TelegramError(BotError):
     pass
 
 
-class MarketDataError(BotError):
+class DexScreenerError(BotError):
     pass
 
 
@@ -45,9 +45,43 @@ def service_for_url(url: str) -> tuple[str, type[BotError]]:
     host = urllib.parse.urlsplit(url).hostname
     if host == "api.telegram.org":
         return "Telegram", TelegramError
-    if host == "api.geckoterminal.com":
-        return "GeckoTerminal", MarketDataError
-    return "API externa", MarketDataError
+    if host == "api.dexscreener.com":
+        return "DexScreener", DexScreenerError
+    return "API externa", DexScreenerError
+
+
+BASE58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+
+
+def is_valid_solana_address(value: str) -> bool:
+    """Validate a Solana public key as a whitespace-free 32-byte Base58 value."""
+    if not isinstance(value, str) or not value or any(char.isspace() for char in value):
+        return False
+    if any(char not in BASE58_ALPHABET for char in value):
+        return False
+    number = 0
+    for char in value:
+        number = number * 58 + BASE58_ALPHABET.index(char)
+    decoded_length = (number.bit_length() + 7) // 8
+    decoded_length += len(value) - len(value.lstrip("1"))
+    return decoded_length == 32
+
+
+COMMAND_ALIASES = {"/preço": "/price", "/add": "/watch", "/lista": "/list", "/remove": "/unwatch"}
+
+
+def parse_message(text: str) -> tuple[str | None, str]:
+    """Return canonical command and one argument, including bare Solana addresses."""
+    if not isinstance(text, str):
+        return None, ""
+    stripped = text.strip()
+    if is_valid_solana_address(stripped):
+        return "/price", stripped
+    if not stripped.startswith("/"):
+        return None, ""
+    parts = stripped.split(maxsplit=1)
+    raw_command = parts[0].split("@", 1)[0].casefold()
+    return COMMAND_ALIASES.get(raw_command, raw_command), parts[1].strip() if len(parts) > 1 else ""
 
 
 def redact_token(value: str, url: str) -> str:
@@ -76,11 +110,30 @@ def load_state() -> dict[str, Any]:
         value = json.loads(STATE_FILE.read_text(encoding="utf-8"))
         if not isinstance(value, dict) or not isinstance(value.get("watches", {}), dict):
             raise ValueError("invalid state")
-        value.setdefault("offset", 0)
-        value.setdefault("watches", {})
-        return value
+        try:
+            offset = max(0, int(value.get("offset", 0)))
+        except (TypeError, ValueError, OverflowError):
+            offset = 0
+        watches: dict[str, Any] = {}
+        for entry in value.get("watches", {}).values():
+            if len(watches) >= MAX_WATCHES:
+                break
+            if not isinstance(entry, dict):
+                continue
+            address = entry.get("address")
+            if not is_valid_solana_address(address):
+                continue
+            subscribers = entry.get("subscribers", [])
+            if not isinstance(subscribers, list):
+                subscribers = []
+            normalized = dict(entry)
+            normalized.update(address=address, subscribers=list(dict.fromkeys(str(v) for v in subscribers)))
+            # Base58 addresses are case-sensitive; never lowercase their identity.
+            watches[address] = normalized
+        return {"offset": offset, "watches": watches}
     except (OSError, json.JSONDecodeError, ValueError) as exc:
-        raise BotError("Não foi possível ler o estado salvo em data/state.json.") from exc
+        LOG.error("Estado salvo inválido ou inacessível; iniciando sem offset avançado e sem watches: %s", exc)
+        return {"offset": 0, "watches": {}}
 
 
 def save_state(state: dict[str, Any]) -> None:
@@ -101,8 +154,6 @@ def http_json(url: str, *, method: str = "GET", payload: dict[str, Any] | None =
               timeout: float = API_REQUEST_TIMEOUT_SECONDS) -> Any:
     body = json.dumps(payload).encode() if payload is not None else None
     headers = {"User-Agent": "crypto-telegram-alert/1.0", "Content-Type": "application/json"}
-    if urllib.parse.urlsplit(url).hostname == "api.geckoterminal.com":
-        headers["Accept"] = "application/json;version=20230203"
     request = urllib.request.Request(url, data=body, method=method, headers=headers)
     service, error_type = service_for_url(url)
     try:
@@ -167,77 +218,34 @@ def compact(value: Any) -> str:
         return "indisponível"
 
 
-def normalize_token(token: dict[str, Any], pools: list[dict[str, Any]]) -> dict[str, Any] | None:
-    """Adapt GeckoTerminal token/pool resources to the bot's display format."""
-    attributes = token.get("attributes") or {}
-    if not attributes.get("address"):
-        return None
-    pool_by_id = {pool.get("id"): pool for pool in pools if pool.get("id")}
-    top_pool_ids = (((token.get("relationships") or {}).get("top_pools") or {}).get("data") or [])
-    pool = next((pool_by_id.get(item.get("id")) for item in top_pool_ids if pool_by_id.get(item.get("id"))), None)
-    if pool is None and pools:
-        pool = max(pools, key=lambda p: float((p.get("attributes") or {}).get("reserve_in_usd") or 0))
-    pool_attributes = (pool or {}).get("attributes") or {}
-    token_price = attributes.get("price_usd")
-    if token_price is None:
-        token_price = pool_attributes.get("token_price_usd") or pool_attributes.get("base_token_price_usd")
-    volume = attributes.get("volume_usd") or {}
-    volume_24h = volume.get("h24") if isinstance(volume, dict) else None
-    volume_24h = volume_24h or (pool_attributes.get("volume_usd") or {}).get("h24")
-    price_change = pool_attributes.get("price_change_percentage") or {}
-    pool_address = pool_attributes.get("address")
-    token_address = attributes["address"]
-    return {
-        "chainId": "solana",
-        "baseToken": {"address": token_address, "symbol": attributes.get("symbol"), "name": attributes.get("name")},
-        "priceUsd": token_price,
-        "priceChange": {"h24": price_change.get("h24")},
-        "liquidity": {"usd": attributes.get("total_reserve_in_usd") or pool_attributes.get("reserve_in_usd")},
-        "volume": {"h24": volume_24h},
-        "marketCap": attributes.get("market_cap_usd") or pool_attributes.get("market_cap_usd"),
-        "fdv": attributes.get("fdv_usd") or pool_attributes.get("fdv_usd"),
-        "url": f"https://www.geckoterminal.com/solana/pools/{pool_address}" if pool_address else f"https://www.geckoterminal.com/solana/tokens/{token_address}",
-    }
-
-
-def gecko_pools(result: dict[str, Any]) -> list[dict[str, Any]]:
-    included = result.get("included") or []
-    return [resource for resource in included if resource.get("type") == "pool"]
+def pair_liquidity(pair: dict[str, Any]) -> float:
+    try:
+        return float((pair.get("liquidity") or {}).get("usd") or 0)
+    except (TypeError, ValueError):
+        return 0.0
 
 
 def get_pair(query: str) -> dict[str, Any] | None:
-    """Resolve a Solana token by address or symbol with GeckoTerminal public API."""
-    is_address = bool(re.fullmatch(r"[1-9A-HJ-NP-Za-km-z]{32,50}", query))
-    if is_address:
-        encoded = urllib.parse.quote(query, safe="")
-        result = http_json(f"{GECKO_BASE}/networks/solana/tokens/{encoded}?include=top_pools", timeout=API_REQUEST_TIMEOUT_SECONDS)
-        if not isinstance(result, dict):
-            raise MarketDataError("GeckoTerminal retornou uma resposta em formato inesperado.")
-        token = result.get("data") or {}
-        return normalize_token(token, gecko_pools(result))
+    """Resolve a Solana token by validated address or DexScreener symbol search."""
+    if is_valid_solana_address(query):
+        url = f"{DEX_BASE}/token-pairs/v1/solana/{urllib.parse.quote(query, safe='')}"
+        result = http_json(url, timeout=API_REQUEST_TIMEOUT_SECONDS)
+        if not isinstance(result, list):
+            raise DexScreenerError("DexScreener retornou uma resposta em formato inesperado.")
+        pairs = [pair for pair in result if isinstance(pair, dict) and pair.get("chainId") == "solana"]
+        exact_base = [pair for pair in pairs if str((pair.get("baseToken") or {}).get("address", "")).lower() == query.lower()]
+        return max(exact_base, key=pair_liquidity, default=None)
 
-    params = urllib.parse.urlencode({"query": query, "network": "solana", "include": "base_token,quote_token"})
-    result = http_json(f"{GECKO_BASE}/search/pools?{params}", timeout=API_REQUEST_TIMEOUT_SECONDS)
+    params = urllib.parse.urlencode({"q": query})
+    result = http_json(f"{DEX_BASE}/latest/dex/search?{params}", timeout=API_REQUEST_TIMEOUT_SECONDS)
     if not isinstance(result, dict):
-        raise MarketDataError("GeckoTerminal retornou uma resposta em formato inesperado.")
-    included = result.get("included") or []
-    token_by_id = {resource.get("id"): resource for resource in included if resource.get("type") == "token"}
-    pools = [resource for resource in (result.get("data") or []) if resource.get("type") == "pool"]
-    candidates: list[tuple[dict[str, Any], list[dict[str, Any]]]] = []
-    for pool in pools:
-        relationships = pool.get("relationships") or {}
-        base_ref = ((relationships.get("base_token") or {}).get("data") or {}).get("id")
-        quote_ref = ((relationships.get("quote_token") or {}).get("data") or {}).get("id")
-        base = token_by_id.get(base_ref)
-        quote = token_by_id.get(quote_ref)
-        matching = [token for token in (base, quote) if token and query.casefold() in {
-            str((token.get("attributes") or {}).get("symbol", "")).casefold(),
-            str((token.get("attributes") or {}).get("name", "")).casefold(),
-        }]
-        for token in matching or ([base] if base else []):
-            candidates.append((token, [pool]))
-    pairs = [pair for token, token_pools in candidates if (pair := normalize_token(token, token_pools))]
-    return max(pairs, key=lambda p: float((p.get("liquidity") or {}).get("usd") or 0), default=None)
+        raise DexScreenerError("DexScreener retornou uma resposta em formato inesperado.")
+    pairs = [pair for pair in (result.get("pairs") or []) if isinstance(pair, dict) and pair.get("chainId") == "solana"]
+    matches = [pair for pair in pairs if query.casefold() in {
+        str((pair.get("baseToken") or {}).get("symbol", "")).casefold(),
+        str((pair.get("baseToken") or {}).get("name", "")).casefold(),
+    }]
+    return max(matches or pairs, key=pair_liquidity, default=None)
 
 
 def pair_summary(pair: dict[str, Any]) -> str:
@@ -248,13 +256,13 @@ def pair_summary(pair: dict[str, Any]) -> str:
     return (f"{base.get('symbol') or base.get('name') or 'Token'} (Solana)\n"
         f"Preço: {money(pair.get('priceUsd'))}\nVariação 24h: {change_text}\n"
         f"Liquidez: {compact((pair.get('liquidity') or {}).get('usd'))} · Volume 24h: {compact((pair.get('volume') or {}).get('h24'))}\n"
-        f"Market cap/FDV: {compact(cap)}\nEndereço: {base.get('address', 'indisponível')}\nFonte: GeckoTerminal — {pair.get('url', '')}")
+        f"Market cap/FDV: {compact(cap)}\nEndereço: {base.get('address', 'indisponível')}\nDexScreener: {pair.get('url') or 'indisponível'}")
 
 
 def help_text() -> str:
-    return ("Comandos disponíveis:\n/price <TOKEN ou endereço> — consultar preço\n"
-        "/watch <endereço Solana> — monitorar token\n/unwatch <endereço> — parar monitoramento\n"
-        "/list — listar tokens monitorados\n/help — mostrar ajuda\n\n"
+    return ("Comandos disponíveis:\n/price <TOKEN ou endereço> — consultar preço (ou envie só o endereço)\n"
+        "/watch <endereço Solana> (/add) — monitorar token\n/unwatch <endereço> (/remove) — parar monitoramento\n"
+        "/list (/lista) — listar tokens deste chat\n/help — mostrar ajuda\n\n"
         "Alertas são enviados quando o preço se move pelo percentual configurado.")
 
 
@@ -268,9 +276,10 @@ def handle_update(update: dict[str, Any], state: dict[str, Any], token: str, thr
     if allowed_ids and user_id not in allowed_ids:
         send_message(token, chat_id, "Acesso não autorizado.")
         return
-    parts = message["text"].strip().split(maxsplit=1)
-    command = parts[0].split("@", 1)[0].lower()
-    arg = parts[1].strip() if len(parts) > 1 else ""
+    command, arg = parse_message(message["text"])
+    if command is None:
+        return
+    LOG.info("Comando recebido: chat_id=%s user_id=%s comando=%s", chat_id, user_id or "indisponível", command)
     with STATE_LOCK:
         watches = state["watches"]
         try:
@@ -281,44 +290,67 @@ def handle_update(update: dict[str, Any], state: dict[str, Any], token: str, thr
             elif command == "/price":
                 if not arg:
                     send_message(token, chat_id, "Uso: /price <TOKEN ou endereço>")
+                elif arg.startswith("/") or (" " in arg and is_valid_solana_address(arg)):
+                    send_message(token, chat_id, "Informe apenas um símbolo ou endereço Solana válido.")
+                elif len(arg.split()) > 1:
+                    send_message(token, chat_id, "Informe apenas um símbolo ou endereço Solana válido.")
+                elif any(char.isspace() for char in arg):
+                    send_message(token, chat_id, "Informe apenas um símbolo ou endereço Solana válido.")
                 else:
+                    if 32 <= len(arg) <= 50 and not is_valid_solana_address(arg):
+                        send_message(token, chat_id, "Endereço Solana inválido. Confira o Base58 e tente novamente.")
+                        return
                     pair = get_pair(arg)
-                    send_message(token, chat_id, pair_summary(pair) if pair else "Token Solana não encontrado no GeckoTerminal.")
+                    send_message(token, chat_id, pair_summary(pair) if pair else "Token Solana não encontrado no DexScreener.")
             elif command == "/watch":
-                if not re.fullmatch(r"[1-9A-HJ-NP-Za-km-z]{32,50}", arg):
+                if not is_valid_solana_address(arg):
                     send_message(token, chat_id, "Informe um endereço Solana válido: /watch <endereço>")
                     return
                 pair = get_pair(arg)
                 if not pair:
-                    send_message(token, chat_id, "Não encontrei um par Solana para esse endereço no GeckoTerminal.")
+                    send_message(token, chat_id, "Não encontrei um par Solana para esse endereço no DexScreener.")
                     return
-                address = pair["baseToken"]["address"]
-                key = address.lower()
+                address = arg
+                key = address
                 if key not in watches and len(watches) >= MAX_WATCHES:
                     send_message(token, chat_id, f"Limite de {MAX_WATCHES} tokens monitorados atingido.")
                     return
                 entry = watches.setdefault(key, {"address": address, "subscribers": [], "anchor_price": float(pair.get("priceUsd") or 0), "last_alert": 0})
                 if str(chat_id) not in entry["subscribers"]:
                     entry["subscribers"].append(str(chat_id))
+                base = pair.get("baseToken") or {}
+                entry["symbol"] = base.get("symbol") or base.get("name") or "Token"
+                entry["last_price"] = pair.get("priceUsd")
+                LOG.info("Token adicionado: chat_id=%s user_id=%s address=%s", chat_id, user_id or "indisponível", address)
                 send_message(token, chat_id, f"Monitoramento ativado (limiar {threshold:g}%).\n" + pair_summary(pair))
             elif command == "/unwatch":
-                entry = watches.get(arg.lower()) or next((e for e in watches.values() if e["address"].lower() == arg.lower()), None)
+                if not is_valid_solana_address(arg):
+                    send_message(token, chat_id, "Informe um endereço Solana válido: /unwatch <endereço>")
+                    return
+                entry = watches.get(arg) or next((e for e in watches.values() if e["address"] == arg), None)
                 if not entry or str(chat_id) not in entry["subscribers"]:
                     send_message(token, chat_id, "Esse chat não monitora esse endereço.")
                 else:
                     entry["subscribers"].remove(str(chat_id))
                     if not entry["subscribers"]:
-                        watches.pop(entry["address"].lower(), None)
+                        watches.pop(entry["address"], None)
+                    LOG.info("Token removido: chat_id=%s user_id=%s address=%s", chat_id, user_id or "indisponível", arg)
                     send_message(token, chat_id, "Monitoramento removido.")
             elif command == "/list":
                 entries = [e for e in watches.values() if str(chat_id) in e["subscribers"]]
-                send_message(token, chat_id, "Seus tokens monitorados:\n" + ("\n".join(f"• {e['address']}" for e in entries) if entries else "nenhum"))
+                rows = []
+                for entry in entries:
+                    price = money(entry.get("last_price"))
+                    rows.append(f"• {entry.get('symbol') or 'Token'} — {entry['address']}\n  Preço: {price} · Alerta: {threshold:g}%")
+                send_message(token, chat_id, "Seus tokens monitorados:\n" + ("\n".join(rows) if rows else "nenhum"))
+            else:
+                send_message(token, chat_id, help_text())
         except TelegramError:
             raise
-        except MarketDataError as exc:
-            LOG.warning("GeckoTerminal indisponível ao processar %s: %s", command, exc)
-            send_message(token, chat_id, "GeckoTerminal está temporariamente indisponível. Tente novamente em instantes.")
-        except (BotError, KeyError, TypeError, ValueError) as exc:
+        except DexScreenerError as exc:
+            LOG.warning("Consulta DexScreener falhou em %s: %s", command, exc)
+            send_message(token, chat_id, "DexScreener está temporariamente indisponível. Tente novamente em instantes.")
+        except Exception as exc:
             LOG.warning("Falha ao processar %s: %s", command, exc)
             send_message(token, chat_id, "Não consegui concluir o comando agora. Tente novamente mais tarde.")
 
@@ -326,56 +358,46 @@ def handle_update(update: dict[str, Any], state: dict[str, Any], token: str, thr
 def check_prices(state: dict[str, Any], token: str, threshold: float, cooldown: float) -> None:
     with STATE_LOCK:
         addresses = [(key, entry["address"]) for key, entry in state["watches"].items()]
-    for start in range(0, len(addresses), 30):
+    for key, address in addresses:
         if STOP.is_set():
             return
-        batch = addresses[start:start + 30]
         try:
-            joined = ",".join(address for _, address in batch)
-            endpoint = f"{GECKO_BASE}/networks/solana/tokens/multi/{urllib.parse.quote(joined, safe=',')}?include=top_pools"
-            result = http_json(endpoint, timeout=API_REQUEST_TIMEOUT_SECONDS)
-            if not isinstance(result, dict):
-                raise MarketDataError("GeckoTerminal retornou uma resposta em formato inesperado.")
-            pools = gecko_pools(result)
-            by_address: dict[str, dict[str, Any]] = {}
-            for token_resource in result.get("data") or []:
-                pair = normalize_token(token_resource, pools)
-                if pair:
-                    by_address[pair["baseToken"]["address"].lower()] = pair
-            for key, _ in batch:
-                pair = by_address.get(key)
-                if not pair or not pair.get("priceUsd"):
+            pair = get_pair(address)
+            if not pair or not pair.get("priceUsd"):
+                continue
+            now = time.time()
+            price = float(pair["priceUsd"])
+            base = pair.get("baseToken") or {}
+            with STATE_LOCK:
+                entry = state["watches"].get(key)
+                if entry is None:
                     continue
-                now = time.time()
-                price = float(pair["priceUsd"])
+                entry["last_price"] = price
+                entry["symbol"] = base.get("symbol") or base.get("name") or entry.get("symbol") or "Token"
+                anchor = float(entry.get("anchor_price") or price)
+                if anchor <= 0:
+                    entry["anchor_price"] = price
+                    continue
+                change = (price / anchor - 1) * 100
+                if abs(change) < threshold or now - float(entry.get("last_alert", 0)) < cooldown:
+                    continue
+                subscribers = list(entry.get("subscribers", []))
+            text = f"🚨 Alerta de preço: {change:+.2f}% desde o último alerta\n" + pair_summary(pair)
+            delivered = False
+            for chat_id in subscribers:
+                try:
+                    send_message(token, chat_id, text)
+                    delivered = True
+                except TelegramError as exc:
+                    LOG.warning("Telegram não entregou alerta; será tentado novamente no próximo ciclo: %s", exc)
+            if delivered:
                 with STATE_LOCK:
                     entry = state["watches"].get(key)
-                    if entry is None:
-                        continue
-                    anchor = float(entry.get("anchor_price") or price)
-                    if anchor <= 0:
+                    if entry is not None:
                         entry["anchor_price"] = price
-                        continue
-                    change = (price / anchor - 1) * 100
-                    if abs(change) < threshold or now - float(entry.get("last_alert", 0)) < cooldown:
-                        continue
-                    subscribers = list(entry.get("subscribers", []))
-                text = f"🚨 Alerta de preço: {change:+.2f}% desde o último alerta\n" + pair_summary(pair)
-                delivered = False
-                for chat_id in subscribers:
-                    try:
-                        send_message(token, chat_id, text)
-                        delivered = True
-                    except TelegramError as exc:
-                        LOG.warning("Telegram não entregou alerta; será tentado novamente no próximo ciclo: %s", exc)
-                if delivered:
-                    with STATE_LOCK:
-                        entry = state["watches"].get(key)
-                        if entry is not None:
-                            entry["anchor_price"] = price
-                            entry["last_alert"] = now
-        except MarketDataError as exc:
-            LOG.warning("GeckoTerminal falhou no monitoramento; o bot continua ativo: %s", exc)
+                        entry["last_alert"] = now
+        except DexScreenerError as exc:
+            LOG.warning("DexScreener falhou ao consultar token monitorado %s: %s", address, exc)
 
 
 def market_monitor(state: dict[str, Any], token: str, threshold: float, cooldown: float) -> None:
@@ -437,19 +459,30 @@ def main() -> int:
         return 0
 
     LOG.info("Worker contínuo iniciado; tokens monitorados: %d", len(state["watches"]))
-    monitor = threading.Thread(target=market_monitor, args=(state, token, threshold, cooldown), name="geckoterminal-monitor", daemon=True)
+    monitor = threading.Thread(target=market_monitor, args=(state, token, threshold, cooldown), name="dexscreener-monitor", daemon=True)
     monitor.start()
     failures = 0
+    first_poll = True
     deadline = time.monotonic() + run_seconds if run_seconds else None
     while not STOP.is_set() and (deadline is None or time.monotonic() < deadline):
         try:
-            updates = telegram(token, "getUpdates", {"offset": int(state["offset"]), "timeout": TELEGRAM_POLL_TIMEOUT_SECONDS, "allowed_updates": ["message"]}) or []
+            # Always start at offset 0 so a stale/corrupt cached offset cannot skip pending updates.
+            # Successful updates are acknowledged by incrementing offset below.
+            poll_offset = 0 if first_poll else int(state["offset"])
+            updates = telegram(token, "getUpdates", {"offset": poll_offset, "timeout": TELEGRAM_POLL_TIMEOUT_SECONDS, "allowed_updates": ["message"]}) or []
+            if updates:
+                first_poll = False
             failures = 0
             for update in updates:
                 try:
                     handle_update(update, state, token, threshold, allowed_ids)
                 except TelegramError as exc:
                     LOG.warning("Falha Telegram ao responder atualização %s; ela será repetida: %s", update.get("update_id", "?"), exc)
+                    first_poll = True
+                    break
+                except Exception:
+                    LOG.exception("Erro isolado ao processar atualização %s; polling continuará.", update.get("update_id", "?"))
+                    first_poll = True
                     break
                 with STATE_LOCK:
                     state["offset"] = update["update_id"] + 1
@@ -458,6 +491,12 @@ def main() -> int:
             failures += 1
             delay = min(60, 2 ** min(failures - 1, 6))
             LOG.warning("Falha temporária no polling Telegram; nova tentativa em %ss: %s", delay, exc)
+            STOP.wait(delay)
+        except Exception:
+            failures += 1
+            first_poll = True
+            delay = min(60, 2 ** min(failures - 1, 6))
+            LOG.exception("Erro inesperado no ciclo do polling; nova tentativa em %ss.", delay)
             STOP.wait(delay)
     with STATE_LOCK:
         save_state(state)
