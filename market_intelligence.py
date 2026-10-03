@@ -72,7 +72,8 @@ def _score(value: float, low: float, high: float) -> float:
 
 
 def analyze(snapshots: list[dict[str, Any]], pair: dict[str, Any] | None = None,
-            timestamp: float | None = None) -> dict[str, Any]:
+            timestamp: float | None = None, flow: dict[str, Any] | None = None,
+            whale_flow_weight: float = 10) -> dict[str, Any]:
     """Combine available market and locally sampled history without filling gaps."""
     rows = sorted((row for row in snapshots if number(row.get("price")) and number(row.get("timestamp"))),
                   key=lambda row: float(row["timestamp"]))
@@ -159,11 +160,30 @@ def analyze(snapshots: list[dict[str, Any]], pair: dict[str, Any] | None = None,
         components["fdv_overhang"] = max(0, 100 - _score(fdv / market_cap, 1, 10))
     if metrics["consistency_pct"] is not None:
         components["consistency"] = metrics["consistency_pct"]
+    from market_flow import intelligence_score
+    flow_score = intelligence_score(flow or {})
+    if flow_score is not None:
+        components["whale_flow"] = flow_score
+        flow_window = (flow or {}).get("windows", {}).get("15m", {})
+        metrics["flow_buy_usd_15m"] = flow_window.get("buy_usd")
+        metrics["flow_sell_usd_15m"] = flow_window.get("sell_usd")
+        metrics["flow_net_usd_15m"] = flow_window.get("net_usd")
+        metrics["flow_divergence"] = (flow or {}).get("divergence")
     weights = {"momentum": 22, "volume": 8, "volume_acceleration": 8, "price_acceleration": 8,
                "structure": 18, "liquidity": 14, "volatility": 5, "turnover": 5,
                "market_cap": 5, "fdv_overhang": 3, "consistency": 4}
-    if components:
-        score = round(sum(components[key] * weights[key] for key in components) / sum(weights[key] for key in components))
+    if flow_score is not None:
+        try:
+            configured_flow_weight = max(0.0, min(20.0, float(whale_flow_weight)))
+        except (TypeError, ValueError, OverflowError):
+            configured_flow_weight = 10.0
+        remainder = 100.0 - configured_flow_weight
+        original_total = sum(weights.values())
+        weights = {key: value * remainder / original_total for key, value in weights.items()}
+        weights["whale_flow"] = configured_flow_weight
+    score_components = {key: value for key, value in components.items() if weights.get(key, 0) > 0}
+    if score_components:
+        score = round(sum(score_components[key] * weights[key] for key in score_components) / sum(weights[key] for key in score_components))
         if liquidity is not None and liquidity < MIN_LIQUIDITY_USD:
             score = min(score, 35)
     else:
@@ -187,6 +207,8 @@ def analyze(snapshots: list[dict[str, Any]], pair: dict[str, Any] | None = None,
         exit_risk += min(30, int(abs(metrics["drawdown_pct"]) / 2)); exit_signals.append("Drawdown relevante")
     if r15 is not None and r15 < 0 and metrics["volume_acceleration"] is not None and metrics["volume_acceleration"] > 20:
         exit_risk += 20; exit_signals.append("Queda com aceleração de volume")
+    if flow_score is not None and r15 is not None and r15 < 0 and (metrics.get("flow_net_usd_15m") or 0) < 0:
+        exit_risk += 10; exit_signals.append("Queda com fluxo vendedor observado")
     if liquidity is not None and liquidity < MIN_LIQUIDITY_USD:
         exit_risk += 20; exit_signals.append("Liquidez muito baixa")
     exit_risk = min(100, exit_risk)
@@ -219,7 +241,15 @@ def analyze(snapshots: list[dict[str, Any]], pair: dict[str, Any] | None = None,
                              "invalidation": low, "tp1": None, "tp2": None, "risk_reward": None}
     if enough_history and score is not None and liquidity is not None and liquidity >= MIN_LIQUIDITY_USD:
         if metrics["breakout"] and (metrics["volume_acceleration"] or 0) > 0:
-            entry["type"] = "🔥 BREAKOUT CONFIRMADO"
+            flow_net = metrics.get("flow_net_usd_15m")
+            if flow_score is not None and flow_net is not None and flow_net > 0:
+                entry["type"] = "🔥 BREAKOUT + FLUXO COMPRADOR"
+                metrics["flow_breakout_status"] = "possible_confirmation"
+            elif flow_score is not None:
+                entry["type"] = "⚠️ POSSÍVEL FALSO BREAKOUT · FLUXO NÃO CONFIRMA"
+                metrics["flow_breakout_status"] = "possible_false_breakout"
+            else:
+                entry["type"] = "🔥 BREAKOUT + VOLUME · FLUXO INDISPONÍVEL"
             entry["confirmation"] = price
         elif metrics["drawdown_pct"] is not None and -25 <= metrics["drawdown_pct"] <= -3 and not metrics["support_lost"]:
             entry["type"] = ("🟢 PULLBACK / RETOMADA POTENCIAL"

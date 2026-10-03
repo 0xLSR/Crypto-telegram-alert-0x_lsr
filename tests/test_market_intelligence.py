@@ -50,7 +50,7 @@ class MarketIntelligenceTests(unittest.TestCase):
         self.assertTrue(result["metrics"]["breakout"])
         self.assertGreater(result["metrics"]["volume_acceleration"], 0)
         self.assertEqual(result["state"], "🔥 BREAKOUT")
-        self.assertEqual(result["entry"]["type"], "🔥 BREAKOUT CONFIRMADO")
+        self.assertEqual(result["entry"]["type"], "🔥 BREAKOUT + VOLUME · FLUXO INDISPONÍVEL")
         self.assertGreaterEqual(result["score"], 0)
         self.assertLessEqual(result["score"], 100)
 
@@ -60,7 +60,7 @@ class MarketIntelligenceTests(unittest.TestCase):
         result = mi.analyze(rows)
         self.assertTrue(result["metrics"]["false_breakout_risk"])
         self.assertNotEqual(result["state"], "🔥 BREAKOUT")
-        self.assertNotEqual(result["entry"]["type"], "🔥 BREAKOUT CONFIRMADO")
+        self.assertNotEqual(result["entry"]["type"], "🔥 BREAKOUT + VOLUME · FLUXO INDISPONÍVEL")
 
     def test_falling_price_with_increasing_volume_raises_exit_risk(self):
         prices = [1.0] * 70 + [1 - i * .015 for i in range(1, 31)]

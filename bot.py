@@ -21,6 +21,7 @@ from typing import Any
 
 import wallet as solana_wallet
 import market_intelligence as intelligence
+import market_flow as flow_analysis
 
 API_BASE = "https://api.telegram.org/bot{token}/{method}"
 GECKO_BASE = "https://api.geckoterminal.com/api/v2"
@@ -55,6 +56,21 @@ INTELLIGENCE_MARKET_CACHE: dict[str, tuple[float, dict[str, Any] | None]] = {}
 LOG = logging.getLogger("crypto_alert_bot")
 STATE_LOCK = threading.RLock()
 STOP = threading.Event()
+FLOW_CURSOR = 0
+GECKO_RATE_LOCK = threading.Lock()
+GECKO_LAST_REQUEST_AT = 0.0
+try:
+    FLOW_REQUESTS_PER_CYCLE = max(1, min(3, int(os.getenv("FLOW_REQUESTS_PER_CYCLE", "3"))))
+except ValueError:
+    FLOW_REQUESTS_PER_CYCLE = 3
+try:
+    SMART_FLOW_COOLDOWN_SECONDS = max(60, min(86400, int(os.getenv("SMART_FLOW_COOLDOWN_MINUTES", "30")) * 60))
+except ValueError:
+    SMART_FLOW_COOLDOWN_SECONDS = 1800
+try:
+    WHALE_FLOW_WEIGHT_PERCENT = max(0.0, min(20.0, float(os.getenv("WHALE_FLOW_WEIGHT_PERCENT", "10"))))
+except ValueError:
+    WHALE_FLOW_WEIGHT_PERCENT = 10.0
 
 
 class BotError(Exception):
@@ -179,6 +195,8 @@ def load_state() -> dict[str, Any]:
             normalized.setdefault("anchor_price", 0)
             normalized.setdefault("timestamp", normalized.get("added_at", time.time()))
             normalized.setdefault("reference_price", normalized.get("anchor_price", 0))
+            if "flow" in normalized:
+                normalized["flow"] = flow_analysis.sanitize_flow(normalized.get("flow"))
             # Base58 addresses are case-sensitive; never lowercase their identity.
             watches[address] = normalized
         awaiting_add = value.get("awaiting_add", {})
@@ -294,6 +312,7 @@ def save_state(state: dict[str, Any]) -> None:
 
 def http_json(url: str, *, method: str = "GET", payload: dict[str, Any] | None = None,
               timeout: float = API_REQUEST_TIMEOUT_SECONDS) -> Any:
+    global GECKO_LAST_REQUEST_AT
     body = json.dumps(payload).encode() if payload is not None else None
     headers = {"User-Agent": "crypto-telegram-alert/1.0", "Content-Type": "application/json"}
     if urllib.parse.urlsplit(url).hostname == "api.geckoterminal.com":
@@ -301,8 +320,21 @@ def http_json(url: str, *, method: str = "GET", payload: dict[str, Any] | None =
     request = urllib.request.Request(url, data=body, method=method, headers=headers)
     service, error_type = service_for_url(url)
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
-            return json.loads(response.read().decode("utf-8"))
+        def read_response() -> str:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                return response.read().decode("utf-8")
+        if urllib.parse.urlsplit(url).hostname == "api.geckoterminal.com":
+            # GeckoTerminal's unauthenticated public API allows about 10 req/min.
+            # Serialize requests and leave a small safety margin for clock/network jitter.
+            with GECKO_RATE_LOCK:
+                delay = 6.25 - (time.monotonic() - GECKO_LAST_REQUEST_AT)
+                if GECKO_LAST_REQUEST_AT and delay > 0:
+                    time.sleep(delay)
+                GECKO_LAST_REQUEST_AT = time.monotonic()
+                response_body = read_response()
+        else:
+            response_body = read_response()
+        return json.loads(response_body)
     except urllib.error.HTTPError as exc:
         detail = redact_token(exc.read().decode("utf-8", errors="replace"), url)
         LOG.error("%s respondeu HTTP %s; corpo da resposta: %s", service, exc.code, detail[:4000])
@@ -502,6 +534,7 @@ def normalize_gecko_token(token: dict[str, Any], pools: list[dict[str, Any]]) ->
         "url": f"https://www.geckoterminal.com/solana/pools/{address_pool}" if address_pool else f"https://www.geckoterminal.com/solana/tokens/{address}",
         "geckoUrl": f"https://www.geckoterminal.com/solana/pools/{address_pool}" if address_pool else f"https://www.geckoterminal.com/solana/tokens/{address}",
         "dexUrl": f"https://dexscreener.com/solana/{address_pool}" if address_pool else None,
+        "poolAddress": address_pool,
         "dataSource": "GeckoTerminal",
     }
 
@@ -555,6 +588,18 @@ def get_gecko_pairs(addresses: list[str]) -> dict[str, dict[str, Any]]:
         if pair and pair.get("priceUsd") and pair["baseToken"]["address"] in requested:
             pairs[pair["baseToken"]["address"]] = pair
     return pairs
+
+
+def get_gecko_trades(pool_address: str, token_address: str) -> list[dict[str, Any]]:
+    """Fetch the public latest-trades endpoint oriented to this Solana mint."""
+    pool = urllib.parse.quote(pool_address, safe="")
+    mint = urllib.parse.quote(token_address, safe="")
+    response = http_json(f"{GECKO_BASE}/networks/solana/pools/{pool}/trades?token={mint}",
+                         timeout=API_REQUEST_TIMEOUT_SECONDS)
+    try:
+        return flow_analysis.parse_trades(response, token_address)
+    except ValueError as exc:
+        raise GeckoTerminalError(str(exc)) from exc
 
 
 def get_dexscreener_pair(query: str) -> dict[str, Any] | None:
@@ -970,6 +1015,28 @@ def intelligence_analysis_text(address: str, entry: dict[str, Any], result: dict
     change = (pair or {}).get("priceChange", {}).get("h24")
     if change is not None:
         lines.append(f"📈 24h: {signed_percent(change)}")
+    flow_state = entry.get("flow") if isinstance(entry.get("flow"), dict) else {}
+    flow_summary = flow_state.get("summary") if isinstance(flow_state.get("summary"), dict) else {}
+    if flow_summary.get("available"):
+        lines += ["", "🐋 FLUXO DE MERCADO"]
+        for period in ("5m", "15m", "30m", "1h", "4h", "24h"):
+            window = flow_summary.get("windows", {}).get(period)
+            if not isinstance(window, dict):
+                continue
+            if not window.get("known_trades"):
+                lines.append(f"{period}: ⚪ {window.get('unknown_trades', 0)} operações sem BUY/SELL confiável")
+                continue
+            lines.append(f"{period}: compras {wallet_usd(window['buy_usd'])} · vendas {wallet_usd(window['sell_usd'])} · líquido {wallet_usd(window['net_usd'])}")
+        if flow_state.get("possibly_truncated"):
+            lines.append("⚠️ Fonte devolveu 300 trades; períodos maiores podem estar incompletos.")
+        divergence_names = {"price_up_buying": "🟢 possível confirmação comprador/preço",
+                            "price_up_selling": "⚠️ divergência: preço em alta e fluxo vendedor",
+                            "price_down_buying": "🟡 possível absorção: preço em queda e fluxo comprador",
+                            "price_down_selling": "🔴 pressão vendedora observada"}
+        if flow_summary.get("divergence") in divergence_names:
+            lines.append(divergence_names[flow_summary["divergence"]])
+    elif flow_state:
+        lines += ["", "🐋 FLUXO DE MERCADO", "Dados de trades temporariamente indisponíveis; fluxo não pontuado."]
     lines += ["", "━━━━━━━━━━━━━━━━━━━━", "", f"🧠 Estado: {result.get('state', '⚪ SEM DADOS')}",
               f"Score: {score if score is not None else '—'}/100"]
     if score is not None:
@@ -994,7 +1061,7 @@ def intelligence_analysis_text(address: str, entry: dict[str, Any], result: dict
                        "liquidity": "Liquidez", "volatility": "Volatilidade", "volume_acceleration": "Aceleração de volume",
                        "price_acceleration": "Aceleração de preço", "turnover": "Volume / market cap",
                        "market_cap": "Market cap", "fdv_overhang": "Relação FDV / market cap",
-                       "consistency": "Consistência do movimento"}
+                       "consistency": "Consistência do movimento", "whale_flow": "Whale Flow"}
     if result.get("components"):
         lines.append("\nComponentes disponíveis:")
         lines.extend(f"• {component_names.get(key, key)}: {round(value)}/100" for key, value in result["components"].items())
@@ -1054,7 +1121,9 @@ def intelligence_scan_text(entries: list[dict[str, Any]], history: dict[str, lis
         if pair is None:
             continue
         latest_timestamp = snapshots[-1].get("timestamp") if snapshots else None
-        result = intelligence.analyze(snapshots, pair, timestamp=latest_timestamp)
+        entry_flow = (entry.get("flow") or {}).get("summary") if isinstance(entry.get("flow"), dict) else None
+        result = intelligence.analyze(snapshots, pair, timestamp=latest_timestamp, flow=entry_flow,
+                                      whale_flow_weight=WHALE_FLOW_WEIGHT_PERCENT)
         if result.get("score") is None:
             continue
         if opportunities and (result["score"] < MIN_INTELLIGENCE_SCORE or result.get("insufficient")):
@@ -1143,7 +1212,9 @@ def intelligence_single_screen(state: dict[str, Any], chat_id: int | str, addres
     if not pair:
         return "⚠️ Dados de mercado indisponíveis.", back_markup()
     history = state.setdefault("market_history", {}).get(address, [])
-    result = intelligence.analyze(history, pair)
+    entry_flow = (entry.get("flow") or {}).get("summary") if isinstance(entry.get("flow"), dict) else None
+    result = intelligence.analyze(history, pair, flow=entry_flow,
+                                  whale_flow_weight=WHALE_FLOW_WEIGHT_PERCENT)
     text = intelligence_analysis_text(address, entry, result, pair, mode)
     if user_id and user_id.isdigit():
         tracked_wallet = current_wallet(state, user_id, chat_id)
@@ -1859,8 +1930,15 @@ def handle_callback_update(update: dict[str, Any], state: dict[str, Any], token:
 
 
 def check_prices(state: dict[str, Any], token: str, threshold: float, cooldown: float) -> None:
+    global FLOW_CURSOR
     with STATE_LOCK:
         addresses = [(key, entry["address"]) for key, entry in state["watches"].items()]
+    flow_targets: set[str] = set()
+    if addresses:
+        first = FLOW_CURSOR % len(addresses)
+        budget = min(FLOW_REQUESTS_PER_CYCLE, len(addresses))
+        flow_targets = {addresses[(first + index) % len(addresses)][1] for index in range(budget)}
+        FLOW_CURSOR = (first + budget) % len(addresses)
     for start in range(0, len(addresses), 30):
         if STOP.is_set():
             return
@@ -1889,10 +1967,60 @@ def check_prices(state: dict[str, Any], token: str, threshold: float, cooldown: 
                 if not math.isfinite(price) or price <= 0:
                     continue
                 base = pair.get("baseToken") or {}
+                flow_rows = None
+                flow_error = None
+                if address in flow_targets and pair.get("poolAddress"):
+                    try:
+                        flow_rows = get_gecko_trades(pair["poolAddress"], address)
+                    except Exception as exc:
+                        flow_error = str(exc)
+                        LOG.warning("Consulta de trades GeckoTerminal falhou para %s: %s", address, flow_error)
                 with STATE_LOCK:
                     entry = state["watches"].get(key)
                     if entry is None:
                         continue
+                    previous_price = intelligence.number(entry.get("last_price"))
+                    flow_event = None
+                    flow_summary = None
+                    history_rows = state.get("market_history", {}).get(address, [])
+                    old_15m = [row for row in history_rows if isinstance(row, dict)
+                               and intelligence.number(row.get("timestamp")) is not None
+                               and now - 1800 <= float(row["timestamp"]) <= now - 900]
+                    price_15m = float(old_15m[-1]["price"]) if old_15m and intelligence.number(old_15m[-1].get("price")) else None
+                    existing_flow = flow_analysis.sanitize_flow(entry.get("flow"))
+                    if address in flow_targets and flow_error:
+                        existing_flow.update(available=False, last_check=now, last_fetch_at=now,
+                                             last_error=flow_error[:300])
+                        if isinstance(existing_flow.get("summary"), dict):
+                            existing_flow["summary"]["available"] = False
+                        entry["flow"] = existing_flow
+                    elif address in flow_targets and not pair.get("poolAddress"):
+                        existing_flow.update(available=False, last_check=now, last_fetch_at=now,
+                                             last_error="Esta fonte não identificou um pool GeckoTerminal.")
+                        if isinstance(existing_flow.get("summary"), dict):
+                            existing_flow["summary"]["available"] = False
+                        entry["flow"] = existing_flow
+                    elif existing_flow.get("initialized") and not existing_flow.get("last_error"):
+                        flow_state, flow_event = flow_analysis.update_flow(
+                            existing_flow, flow_rows or [], now=now,
+                            liquidity_usd=intelligence.number((pair.get("liquidity") or {}).get("usd")),
+                            previous_price=price_15m, current_price=price,
+                            cooldown_seconds=SMART_FLOW_COOLDOWN_SECONDS)
+                        if address in flow_targets:
+                            flow_state["last_fetch_at"] = now
+                            flow_state["possibly_truncated"] = len(flow_rows or []) >= 300
+                        entry["flow"] = flow_state
+                        flow_summary = flow_state.get("summary") if flow_state.get("available") else None
+                    elif address in flow_targets and pair.get("poolAddress") and flow_rows is not None:
+                        flow_state, flow_event = flow_analysis.update_flow(
+                            existing_flow, flow_rows, now=now,
+                            liquidity_usd=intelligence.number((pair.get("liquidity") or {}).get("usd")),
+                            previous_price=price_15m, current_price=price,
+                            cooldown_seconds=SMART_FLOW_COOLDOWN_SECONDS)
+                        flow_state["last_fetch_at"] = now
+                        flow_state["possibly_truncated"] = len(flow_rows or []) >= 300
+                        entry["flow"] = flow_state
+                        flow_summary = flow_state.get("summary") if flow_state.get("available") else None
                     entry["last_price"] = price
                     entry["last_change_24h"] = (pair.get("priceChange") or {}).get("h24")
                     entry["market_cap"] = pair.get("marketCap")
@@ -1910,7 +2038,8 @@ def check_prices(state: dict[str, Any], token: str, threshold: float, cooldown: 
                         market_history = state.setdefault("market_history", {})
                         snapshot = intelligence.append_snapshot(market_history, address, pair, now,
                                                                 HISTORY_RETENTION_HOURS, INTELLIGENCE_INTERVAL_SECONDS)
-                        result = intelligence.analyze(market_history.get(address, []), pair, timestamp=now)
+                        result = intelligence.analyze(market_history.get(address, []), pair, timestamp=now,
+                                                      flow=flow_summary, whale_flow_weight=WHALE_FLOW_WEIGHT_PERCENT)
                         if snapshot:
                             signals = state.setdefault("signals", [])
                             intelligence.record_signal(signals, address, result, snapshot)
@@ -1940,6 +2069,39 @@ def check_prices(state: dict[str, Any], token: str, threshold: float, cooldown: 
                         subscribers = []
                     else:
                         subscribers = list(entry.get("subscribers", []))
+                    flow_notice = None
+                    if SMART_ALERTS_ENABLED and flow_event and flow_summary:
+                        window = flow_summary.get("windows", {}).get("15m", {})
+                        side = flow_event["side"]
+                        symbol = base.get("symbol") or base.get("name") or "TOKEN"
+                        if flow_event["type"] == "large_sequence":
+                            headline = "🐋 COMPRAS GRANDES EM SEQUÊNCIA" if side == "buy" else "🚨 VENDAS GRANDES EM SEQUÊNCIA"
+                        elif flow_event["type"] == "acceleration":
+                            headline = "🔥 FLUXO COMPRADOR ACELERANDO" if side == "buy" else "🔥 FLUXO VENDEDOR ACELERANDO"
+                        elif flow_event["type"] == "large_trade":
+                            headline = "🔥 COMPRA GRANDE" if side == "buy" else "🚨 VENDA GRANDE"
+                        else:
+                            headline = "🔥 FLUXO COMPRADOR" if side == "buy" else "🚨 FLUXO VENDEDOR"
+                        liquidity = intelligence.number((pair.get("liquidity") or {}).get("usd"))
+                        share = f"\n📊 ~{flow_event['usd'] / liquidity * 100:.1f}% da liquidez" if liquidity and liquidity > 0 else ""
+                        price_delta = flow_summary.get("price_change_pct")
+                        price_line = f"\n📈 Preço: {price_delta:+.2f}%" if price_delta is not None else ""
+                        score = result.get("score") if INTELLIGENCE_ENABLED else None
+                        flow_lines = [f"🐋 {symbol}", "", headline, "", "Últimos 15 min:",
+                                      f"🟢 Compras: {wallet_usd(window.get('buy_usd', 0))}",
+                                      f"🔴 Vendas: {wallet_usd(window.get('sell_usd', 0))}",
+                                      f"💵 Líquido: {wallet_usd(window.get('net_usd', 0))}{share}{price_line}"]
+                        if flow_event["type"] in {"large_trade", "large_sequence"}:
+                            flow_lines.append(f"⚡ Operações relevantes agrupadas: {flow_event['count']}")
+                        if score is not None:
+                            flow_lines.append(f"\n🧠 Score: {score}/100")
+                        if INTELLIGENCE_ENABLED and result.get("exit_risk") is not None:
+                            flow_lines.append(f"🚨 Exit Risk: {result['exit_risk']}/100")
+                        flow_text = "\n".join(flow_lines)
+                        flow_wallets = [(str(uid), dict(wallet_entry)) for uid, wallet_entry in state.get("wallets", {}).items()
+                                        if str(wallet_entry.get("chat_id")) in entry.get("subscribers", [])]
+                        flow_notice = (list(entry.get("subscribers", [])), flow_text,
+                                       {"inline_keyboard": [[button("🧠 Analisar", f"ia:{address}")]]}, flow_wallets)
                 if smart_notice:
                     smart_subscribers, smart_text, smart_markup, smart_wallets = smart_notice
                     for chat_id in smart_subscribers:
@@ -1959,6 +2121,25 @@ def check_prices(state: dict[str, Any], token: str, threshold: float, cooldown: 
                             send_message(token, chat_id, personalized_text, smart_markup)
                         except TelegramError as exc:
                             LOG.warning("Telegram não entregou alerta inteligente: %s", exc)
+                if flow_notice:
+                    flow_subscribers, flow_text, flow_markup, flow_wallets = flow_notice
+                    for chat_id in flow_subscribers:
+                        personalized_text = flow_text
+                        for _wallet_user, wallet_entry in flow_wallets:
+                            if str(wallet_entry.get("chat_id")) != str(chat_id):
+                                continue
+                            try:
+                                amount, _decimals = solana_wallet.get_token_balance(wallet_entry["address"], address)
+                                market_price = Decimal(str(pair["priceUsd"]))
+                                if amount > 0 and market_price.is_finite() and market_price > 0:
+                                    personalized_text = ("🚨 ALERTA DA SUA POSIÇÃO\n\n" + personalized_text
+                                                         + f"\n\n💼 Valor atual: {wallet_usd(amount * market_price)}. PnL indisponível sem custo de aquisição.")
+                            except (solana_wallet.WalletRpcError, InvalidOperation, TypeError, ValueError) as exc:
+                                LOG.info("[WALLET] Não foi possível anexar posição ao alerta de fluxo: %s", exc)
+                        try:
+                            send_message(token, chat_id, personalized_text, flow_markup)
+                        except TelegramError as exc:
+                            LOG.warning("Telegram não entregou alerta de fluxo para %s: %s", chat_id, exc)
                 if not subscribers:
                     continue
                 alert_token = base.get("symbol") or base.get("name") or "TOKEN"

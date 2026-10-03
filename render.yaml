@@ -30,6 +30,12 @@ services:
         value: "75"
       - key: SMART_ALERTS_ENABLED
         value: "true"
+      - key: SMART_FLOW_COOLDOWN_MINUTES
+        value: "30"
+      - key: FLOW_REQUESTS_PER_CYCLE
+        value: "3"
+      - key: WHALE_FLOW_WEIGHT_PERCENT
+        value: "10"
       - key: BOT_STATE_FILE
         value: /var/data/state.json
     disk:
