@@ -1511,7 +1511,8 @@ def check_prices(state: dict[str, Any], token: str, threshold: float, cooldown: 
                     if abs(change) < threshold or now - float(entry.get("last_alert", 0)) < cooldown:
                         continue
                     subscribers = list(entry.get("subscribers", []))
-                text = f"🚨 Alerta de preço: 💰 {signed_percent(change)} desde o último alerta\n\n" + pair_summary(pair, alert_change=change)
+                alert_token = base.get("symbol") or base.get("name") or "TOKEN"
+                text = f"{movement_icon(change)} {signed_percent(change)} • {alert_token}\n\n" + pair_summary(pair, alert_change=change)
                 delivered = False
                 for chat_id in subscribers:
                     try:

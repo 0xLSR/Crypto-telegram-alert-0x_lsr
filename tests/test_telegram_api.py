@@ -243,7 +243,7 @@ class TelegramCommandTests(unittest.TestCase):
         request.assert_called_with([ADDRESS])
         fallback.assert_not_called()
         send.assert_called_once()
-        self.assertIn("🚨 Alerta de preço: 💰 +20.00% desde o último alerta", send.call_args.args[2])
+        self.assertEqual(send.call_args.args[2].splitlines()[0], "🟢🤑 +20.00% • SOL")
         self.assertIn("🟢🤑 Wrapped SOL", send.call_args.args[2])
         self.assertEqual(state["watches"][ADDRESS]["last_price"], 140.0)
         self.assertEqual(state["watches"][ADDRESS]["anchor_price"], 120.0)
@@ -258,7 +258,7 @@ class TelegramCommandTests(unittest.TestCase):
                     with patch.object(bot, "send_message") as send:
                         bot.check_prices(state, TOKEN, 10, 1800)
                 alert = send.call_args.args[2]
-                self.assertIn(f"🚨 Alerta de preço: 💰 {header} desde o último alerta", alert)
+                self.assertEqual(alert.splitlines()[0], f"{direction} {header} • SOL")
                 self.assertIn(f"\n\n━━━━━━━━━━━━━━━━━━━━\n\n{direction} Wrapped SOL", alert)
 
     def test_periodic_monitor_falls_back_to_dex_after_gecko_failure(self):
