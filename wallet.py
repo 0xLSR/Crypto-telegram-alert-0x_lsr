@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import time
 import urllib.error
 import urllib.request
 from decimal import Decimal, InvalidOperation
@@ -16,6 +17,8 @@ TOKEN_PROGRAMS = (
     "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
     "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",
 )
+PRICE_CACHE_TTL_SECONDS = 60
+_PRICE_CACHE: dict[str, tuple[float, dict[str, Any] | None]] = {}
 
 
 class WalletRpcError(Exception):
@@ -81,6 +84,11 @@ def _decimal(value: Any) -> Decimal | None:
     return parsed if parsed.is_finite() else None
 
 
+def _price(value: Any) -> Decimal | None:
+    parsed = _decimal(value)
+    return parsed if parsed is not None and parsed > 0 else None
+
+
 def _token_amount(account: dict[str, Any]) -> tuple[str, Decimal, int] | None:
     try:
         info = account["account"]["data"]["parsed"]["info"]
@@ -98,7 +106,22 @@ def _token_amount(account: dict[str, Any]) -> tuple[str, Decimal, int] | None:
         return None
 
 
-def get_wallet_info(address: str, market_data: Callable[[str], dict[str, Any] | None]) -> dict[str, Any]:
+def _cached_market_data(mint: str, market_data: Callable[[str], dict[str, Any] | None]) -> dict[str, Any] | None:
+    cached = _PRICE_CACHE.get(mint)
+    now = time.monotonic()
+    if cached and now - cached[0] < PRICE_CACHE_TTL_SECONDS:
+        return cached[1]
+    try:
+        pair = market_data(mint)
+    except Exception:
+        _PRICE_CACHE[mint] = (now, None)
+        raise
+    _PRICE_CACHE[mint] = (now, pair)
+    return pair
+
+
+def get_wallet_info(address: str, market_data: Callable[[str], dict[str, Any] | None],
+                    market_data_many: Callable[[list[str]], dict[str, dict[str, Any]]] | None = None) -> dict[str, Any]:
     """Return SOL and SPL holdings; prices/valuation are included only when available."""
     balance = solana_rpc("getBalance", [address, {"commitment": "confirmed"}])
     try:
@@ -122,21 +145,43 @@ def get_wallet_info(address: str, market_data: Callable[[str], dict[str, Any] | 
 
     sol_price = None
     try:
-        pair = market_data("So11111111111111111111111111111111111111112")
-        sol_price = _decimal(pair.get("priceUsd")) if pair else None
+        pair = _cached_market_data("So11111111111111111111111111111111111111112", market_data)
+        sol_price = _price(pair.get("priceUsd")) if pair else None
     except Exception as exc:
         LOG.info("[WALLET] Cotação pública de SOL indisponível: %s", exc)
 
     tokens = []
-    # Limit public market lookups to the five largest raw token quantities.
-    for mint, (amount, decimals) in sorted(token_accounts.items(), key=lambda item: item[1][0], reverse=True)[:5]:
-        pair = None
-        try:
-            pair = market_data(mint)
-        except Exception as exc:
-            LOG.info("[WALLET] Cotação indisponível para mint %s: %s", mint, exc)
+    mints = list(token_accounts)
+    quotes: dict[str, dict[str, Any] | None] = {}
+    if market_data_many:
+        # GeckoTerminal accepts batches of up to 30 addresses. Batch first to
+        # reduce requests, then use the existing Gecko/Dex fallback per missing mint.
+        for offset in range(0, len(mints), 30):
+            batch = mints[offset:offset + 30]
+            stale = [mint for mint in batch if mint not in _PRICE_CACHE or time.monotonic() - _PRICE_CACHE[mint][0] >= PRICE_CACHE_TTL_SECONDS]
+            for mint in batch:
+                cached = _PRICE_CACHE.get(mint)
+                if cached and time.monotonic() - cached[0] < PRICE_CACHE_TTL_SECONDS:
+                    quotes[mint] = cached[1]
+            if stale:
+                try:
+                    batch_quotes = market_data_many(stale)
+                    if isinstance(batch_quotes, dict):
+                        for mint, pair in batch_quotes.items():
+                            if mint in stale and pair and _price(pair.get("priceUsd")) is not None:
+                                _PRICE_CACHE[mint] = (time.monotonic(), pair)
+                                quotes[mint] = pair
+                except Exception as exc:
+                    LOG.info("[WALLET] Cotação em lote indisponível para %d tokens: %s", len(stale), exc)
+    for mint, (amount, decimals) in token_accounts.items():
+        pair = quotes.get(mint)
+        if pair is None:
+            try:
+                pair = _cached_market_data(mint, market_data)
+            except Exception as exc:
+                LOG.info("[WALLET] Cotação indisponível para mint %s: %s", mint, exc)
         base = (pair or {}).get("baseToken") or {}
-        price = _decimal((pair or {}).get("priceUsd"))
+        price = _price((pair or {}).get("priceUsd"))
         tokens.append({
             "mint": mint,
             "amount": str(amount),
@@ -147,15 +192,17 @@ def get_wallet_info(address: str, market_data: Callable[[str], dict[str, Any] | 
             "value_usd": str(amount * price) if price is not None else None,
         })
 
-    # Total is only shown when every held asset has a usable public quote.
-    estimated = sol * sol_price if sol_price is not None else None
-    if estimated is not None and len(token_accounts) <= 5 and all(item["value_usd"] is not None for item in tokens):
-        estimated += sum((Decimal(item["value_usd"]) for item in tokens), Decimal(0))
-    else:
-        estimated = None
+    sol_value = sol * sol_price if sol_price is not None else None
+    priced_values = [Decimal(item["value_usd"]) for item in tokens if item["value_usd"] is not None]
+    if sol_value is not None:
+        priced_values.append(sol_value)
+    estimated = sum(priced_values, Decimal(0)) if priced_values else None
+    unpriced_tokens = sum(item["value_usd"] is None for item in tokens)
     return {"sol": str(sol), "sol_price_usd": str(sol_price) if sol_price is not None else None,
-            "tokens": tokens, "token_count": len(token_accounts),
-            "estimated_usd": str(estimated) if estimated is not None else None}
+            "sol_value_usd": str(sol_value) if sol_value is not None else None,
+            "tokens": tokens, "token_count": len(token_accounts), "unpriced_tokens": unpriced_tokens,
+            "estimated_usd": str(estimated) if estimated is not None else None,
+            "is_partial": unpriced_tokens > 0 or sol_value is None}
 
 
 def extract_token_changes(transaction: dict[str, Any], wallet_address: str) -> list[dict[str, str]]:

@@ -13,6 +13,9 @@ TOKEN = "123456:abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLM"
 
 
 class WalletRpcTests(unittest.TestCase):
+    def setUp(self):
+        wallet._PRICE_CACHE.clear()
+
     def test_wallet_info_reads_sol_and_spl_balances_and_only_values_quoted_assets(self):
         token_account = {"account": {"data": {"parsed": {"info": {
             "mint": MINT,
@@ -38,6 +41,74 @@ class WalletRpcTests(unittest.TestCase):
         self.assertEqual(info["tokens"][0]["symbol"], "USDC")
         self.assertEqual(info["tokens"][0]["amount"], "100")
         self.assertEqual(info["estimated_usd"], "194.6750")
+
+    def make_wallet_tokens(self, count=20):
+        accounts = []
+        mints = []
+        for index in range(count):
+            mint = ("123456789ABCDEFGHJKLMNPQRSTUVWXYZ"[index] * 32)
+            mints.append(mint)
+            accounts.append({"account": {"data": {"parsed": {"info": {
+                "mint": mint,
+                "tokenAmount": {"amount": "1000000", "decimals": 6, "uiAmountString": "1"},
+            }}}}})
+        return accounts, mints
+
+    def get_wallet_with_tokens(self, accounts, market, batch=None, sol_price="100"):
+        def rpc(method, params):
+            if method == "getBalance":
+                return {"value": 1_000_000_000}
+            if method == "getTokenAccountsByOwner":
+                return {"value": accounts if params[1]["programId"] == wallet.TOKEN_PROGRAMS[0] else []}
+            self.fail(f"Unexpected RPC method: {method}")
+
+        with patch.object(wallet, "solana_rpc", side_effect=rpc):
+            return wallet.get_wallet_info(ADDRESS, market, batch)
+
+    def test_wallet_total_is_partial_when_two_of_twenty_tokens_have_no_quote(self):
+        accounts, mints = self.make_wallet_tokens()
+        quoted = {mint: {"priceUsd": "2", "baseToken": {"symbol": f"T{i}"}}
+                  for i, mint in enumerate(mints[:18])}
+
+        def market(mint):
+            if mint == ADDRESS:
+                return {"priceUsd": "100"}
+            return None
+
+        info = self.get_wallet_with_tokens(accounts, market, lambda batch: {m: quoted[m] for m in batch if m in quoted})
+        self.assertEqual(info["token_count"], 20)
+        self.assertEqual(info["unpriced_tokens"], 2)
+        self.assertEqual(info["estimated_usd"], "136")
+        self.assertTrue(info["is_partial"])
+        self.assertEqual(len(info["tokens"]), 20)
+
+    def test_twenty_tokens_are_all_valued_without_quantity_cutoff(self):
+        accounts, mints = self.make_wallet_tokens()
+        quotes = {mint: {"priceUsd": "1"} for mint in mints}
+        info = self.get_wallet_with_tokens(accounts,
+                                          lambda mint: {"priceUsd": "1"} if mint == ADDRESS else None,
+                                          lambda batch: {mint: quotes[mint] for mint in batch})
+        self.assertEqual(info["estimated_usd"], "21")
+        self.assertEqual(info["unpriced_tokens"], 0)
+        self.assertEqual(len(info["tokens"]), 20)
+
+    def test_all_tokens_unpriced_still_shows_quoted_sol_value(self):
+        accounts, _ = self.make_wallet_tokens()
+        info = self.get_wallet_with_tokens(accounts, lambda mint: {"priceUsd": "100"} if mint == ADDRESS else None)
+        self.assertEqual(info["estimated_usd"], "100")
+        self.assertEqual(info["unpriced_tokens"], 20)
+        self.assertTrue(info["is_partial"])
+
+    def test_valuation_uses_usd_value_not_absolute_token_quantity(self):
+        large, small = "2" * 32, "3" * 32
+        accounts = [
+            {"account": {"data": {"parsed": {"info": {"mint": large, "tokenAmount": {"amount": "1000000000000", "decimals": 0, "uiAmountString": "1000000000000"}}}}}},
+            {"account": {"data": {"parsed": {"info": {"mint": small, "tokenAmount": {"amount": "1", "decimals": 0, "uiAmountString": "1"}}}}}},
+        ]
+        quotes = {large: {"priceUsd": "0.000001"}, small: {"priceUsd": "100"}}
+        info = self.get_wallet_with_tokens(accounts, lambda _: None, lambda batch: {m: quotes[m] for m in batch})
+        self.assertEqual(info["estimated_usd"], "1000100.000000")
+        self.assertEqual(len(info["tokens"]), 2)
 
     def test_rpc_failure_is_typed_and_does_not_leak_rpc_url(self):
         with patch.object(wallet.urllib.request, "urlopen", side_effect=OSError("offline")):
@@ -129,6 +200,33 @@ class WalletBotTests(unittest.TestCase):
         self.assertIn("1.2845 SOL", edit.call_args.args[3])
         self.assertIn("$192.68", edit.call_args.args[3])
         self.assertIn("PnL", edit.call_args.args[3])
+
+    def test_wallet_screen_shows_partial_estimate_and_paginated_asset_details(self):
+        tokens = [{"mint": f"mint-{i}", "amount": "100", "symbol": f"T{i}",
+                   "price_usd": "1" if i < 18 else None, "value_usd": "100" if i < 18 else None}
+                  for i in range(20)]
+        info = {"sol": "0.002860606", "sol_price_usd": "118.62997", "sol_value_usd": "0.3395",
+                "estimated_usd": "1800.3395", "token_count": 20, "unpriced_tokens": 2,
+                "is_partial": True, "tokens": tokens}
+        entry = {"address": ADDRESS, "chat_id": "11", "alerts_enabled": True, "history": []}
+        text = bot.wallet_info_text(ADDRESS, info, entry)
+        self.assertIn("$1,800.34", text)
+        self.assertIn("2 token(s) sem cotação", text)
+        first_page = bot.wallet_info_text(ADDRESS, info, entry, details=True)
+        second_page = bot.wallet_info_text(ADDRESS, info, entry, details=True, detail_page=1)
+        last_page = bot.wallet_info_text(ADDRESS, info, entry, details=True, detail_page=3)
+        self.assertIn("1. T0", first_page)
+        self.assertIn("6. T5", first_page)
+        self.assertNotIn("7. T6", first_page)
+        self.assertIn("7. T6", second_page)
+        self.assertIn("Preço: indisponível\nValor: indisponível", last_page)
+        self.assertTrue(any("wallet_tokens:1" == b.get("callback_data") for row in bot.wallet_markup(entry, detail_page=0, page_count=4)["inline_keyboard"] for b in row))
+        state = {"watches": {}, "wallets": {"22": entry}}
+        with patch.object(bot, "answer_callback"), patch.object(bot, "edit_message") as edit, \
+             patch.object(bot.solana_wallet, "get_wallet_info", return_value=info), patch.object(bot, "save_state"):
+            bot.handle_callback_update(self.callback("wallet_tokens:1"), state, TOKEN, 10, set())
+        self.assertIn("7. T6", edit.call_args.args[3])
+        self.assertIn("wallet_tokens:2", str(edit.call_args.args[4]))
 
         with patch.object(bot, "answer_callback"), patch.object(bot, "edit_message") as edit:
             with patch.object(bot.solana_wallet, "get_wallet_info", side_effect=wallet.WalletRpcError("offline")):

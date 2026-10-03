@@ -626,21 +626,35 @@ def wallet_usd(value: Any) -> str:
         amount = Decimal(str(value)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
     except (InvalidOperation, TypeError, ValueError):
         return "indisponível"
-    return money(amount)
+    return f"${amount:,.2f}"
 
 
-def wallet_markup(wallet: dict[str, Any] | None) -> dict[str, Any]:
+def wallet_markup(wallet: dict[str, Any] | None, *, detail_page: int | None = None, page_count: int = 0) -> dict[str, Any]:
     if not wallet:
         return {"inline_keyboard": [[button("➕ Cadastrar carteira", "wallet_add")], [button("⬅️ Voltar", "menu")]]}
-    return {"inline_keyboard": [
+    rows = []
+    if detail_page is not None and page_count > 1:
+        nav = []
+        if detail_page > 0:
+            nav.append(button("⬅️ Anterior", f"wallet_tokens:{detail_page - 1}"))
+        nav.append({"text": f"{detail_page + 1}/{page_count}", "callback_data": f"wallet_tokens:{detail_page}"})
+        if detail_page + 1 < page_count:
+            nav.append(button("Próxima ➡️", f"wallet_tokens:{detail_page + 1}"))
+        rows.append(nav)
+    rows.extend([
         [button("📊 Ver carteira", "wallet_view"), button("🔄 Atualizar", "wallet_refresh")],
         [button("📜 Histórico", "wallet_history"), button("🔔 Alertas da carteira", "wallet_alerts")],
         [button("🗑️ Remover carteira", "wallet_remove")],
         [button("⬅️ Voltar", "menu")],
-    ]}
+    ])
+    return {"inline_keyboard": rows}
 
 
-def wallet_info_text(address: str, info: dict[str, Any], wallet: dict[str, Any], *, details: bool = False) -> str:
+WALLET_DETAIL_PAGE_SIZE = 6
+
+
+def wallet_info_text(address: str, info: dict[str, Any], wallet: dict[str, Any], *, details: bool = False,
+                     detail_page: int = 0) -> str:
     status = "🟢 Monitoramento ativo" if wallet.get("monitoring_enabled", True) else "⏸️ Monitoramento pausado"
     updated = time.strftime("%H:%M:%S", time.localtime())
     text = ("💼 MINHA CARTEIRA\n\n"
@@ -648,20 +662,35 @@ def wallet_info_text(address: str, info: dict[str, Any], wallet: dict[str, Any],
             f"💰 Saldo SOL: {wallet_amount(info.get('sol'))} SOL\n")
     sol_price = info.get("sol_price_usd")
     if sol_price is not None:
-        text += f"Preço SOL: {money(sol_price)}\n"
+        text += f"Preço SOL: {wallet_usd(sol_price)}\n"
     estimated = info.get("estimated_usd")
-    text += f"\n💵 Valor estimado: {wallet_usd(estimated) if estimated is not None else 'indisponível'}\n"
+    sol_value = info.get("sol_value_usd")
+    if sol_value is not None:
+        text += f"Valor SOL: {wallet_usd(sol_value)}\n"
+    text += f"\n💵 PATRIMÔNIO ESTIMADO: {wallet_usd(estimated) if estimated is not None else 'indisponível'}\n"
     text += f"🪙 Tokens: {int(info.get('token_count', 0))} ativos\n"
+    unpriced = int(info.get("unpriced_tokens", 0) or 0)
+    if unpriced:
+        priced_count = max(0, int(info.get("token_count", 0)) - unpriced)
+        text += f"\n⚠️ {unpriced} token(s) sem cotação\nValor considera SOL e {priced_count} token(s) com preço disponível.\n"
+    elif info.get("is_partial"):
+        text += "\n⚠️ Estimativa parcial: preço do SOL indisponível.\n"
     if details:
         tokens = info.get("tokens", [])
         if tokens:
-            for item in tokens:
+            page_count = max(1, (len(tokens) + WALLET_DETAIL_PAGE_SIZE - 1) // WALLET_DETAIL_PAGE_SIZE)
+            detail_page = min(max(0, detail_page), page_count - 1)
+            page_tokens = tokens[detail_page * WALLET_DETAIL_PAGE_SIZE:(detail_page + 1) * WALLET_DETAIL_PAGE_SIZE]
+            text += "\n🪙 ATIVOS DA CARTEIRA\n"
+            for index, item in enumerate(page_tokens, start=detail_page * WALLET_DETAIL_PAGE_SIZE + 1):
                 label = item.get("symbol") or item.get("name") or "Token não identificado"
-                text += f"\n🪙 {label}\nQuantidade: {wallet_amount(item.get('amount'))}\n"
+                text += f"\n{index}. {label}\nQuantidade: {wallet_amount(item.get('amount'))}\n"
                 if item.get("price_usd") is not None:
                     text += f"Preço: {money(item['price_usd'])}\nValor: {wallet_usd(item.get('value_usd'))}\n"
                 else:
-                    text += "Preço: indisponível\n"
+                    text += "Preço: indisponível\nValor: indisponível\n"
+            if page_count > 1:
+                text += f"\nPágina {detail_page + 1} de {page_count}."
         else:
             text += "\nNenhum token SPL ativo encontrado.\n"
         text += "\n📊 PnL\nIndisponível nesta versão\n"
@@ -677,7 +706,7 @@ def wallet_menu_text(state: dict[str, Any], user_id: str | int, chat_id: str | i
         return ("💼 MINHA CARTEIRA\n\nNenhuma carteira cadastrada.\n\n"
                 "Cadastre o endereço público da sua carteira Solana para começar o monitoramento.", None)
     LOG.info("[WALLET] Checking wallet %s", wallet_short_address(wallet["address"]))
-    info = solana_wallet.get_wallet_info(wallet["address"], get_market_data)
+    info = solana_wallet.get_wallet_info(wallet["address"], get_market_data, get_gecko_pairs)
     return wallet_info_text(wallet["address"], info, wallet), wallet
 
 
@@ -1183,7 +1212,7 @@ def handle_callback_update(update: dict[str, Any], state: dict[str, Any], token:
             else:
                 try:
                     LOG.info("[WALLET] Checking wallet %s", wallet_short_address(wallet["address"]))
-                    info = solana_wallet.get_wallet_info(wallet["address"], get_market_data)
+                    info = solana_wallet.get_wallet_info(wallet["address"], get_market_data, get_gecko_pairs)
                     wallet["last_check"] = time.time()
                     with STATE_LOCK:
                         state["wallets"][user_id]["last_check"] = wallet["last_check"]
@@ -1195,21 +1224,30 @@ def handle_callback_update(update: dict[str, Any], state: dict[str, Any], token:
                     show_callback_screen(token, chat_id, callback_message,
                                          "⚠️ Não consegui consultar a blockchain agora.\n\nTente novamente em alguns segundos.",
                                          wallet_markup(wallet))
-        elif data in {"wallet_view", "wallet_refresh"}:
+        elif data in {"wallet_view", "wallet_refresh"} or data.startswith("wallet_tokens:"):
             wallet = current_wallet(state, user_id, chat_id) if user_id.isdigit() else None
             if not wallet:
                 show_callback_screen(token, chat_id, callback_message, "Nenhuma carteira cadastrada.", wallet_markup(None))
                 return
             try:
                 LOG.info("[WALLET] Checking wallet %s", wallet_short_address(wallet["address"]))
-                info = solana_wallet.get_wallet_info(wallet["address"], get_market_data)
+                info = solana_wallet.get_wallet_info(wallet["address"], get_market_data, get_gecko_pairs)
                 wallet["last_check"] = time.time()
                 with STATE_LOCK:
                     state["wallets"][user_id]["last_check"] = wallet["last_check"]
                     save_state(state)
+                details = data == "wallet_view" or data.startswith("wallet_tokens:")
+                page = 0
+                if data.startswith("wallet_tokens:"):
+                    try:
+                        page = max(0, int(data.partition(":")[2]))
+                    except ValueError:
+                        page = 0
+                page_count = max(1, (len(info.get("tokens", [])) + WALLET_DETAIL_PAGE_SIZE - 1) // WALLET_DETAIL_PAGE_SIZE)
+                page = min(page, page_count - 1)
                 show_callback_screen(token, chat_id, callback_message,
-                                     wallet_info_text(wallet["address"], info, wallet, details=data == "wallet_view"),
-                                     wallet_markup(wallet))
+                                     wallet_info_text(wallet["address"], info, wallet, details=details, detail_page=page),
+                                     wallet_markup(wallet, detail_page=page if details else None, page_count=page_count))
             except solana_wallet.WalletRpcError as exc:
                 LOG.warning("[WALLET] RPC error for wallet %s: %s", wallet_short_address(wallet["address"]), exc)
                 show_callback_screen(token, chat_id, callback_message,
@@ -1271,7 +1309,7 @@ def handle_callback_update(update: dict[str, Any], state: dict[str, Any], token:
             wallet = current_wallet(state, user_id, chat_id) if user_id.isdigit() else None
             if wallet:
                 try:
-                    info = solana_wallet.get_wallet_info(wallet["address"], get_market_data)
+                    info = solana_wallet.get_wallet_info(wallet["address"], get_market_data, get_gecko_pairs)
                     show_callback_screen(token, chat_id, callback_message, wallet_info_text(wallet["address"], info, wallet), wallet_markup(wallet))
                 except solana_wallet.WalletRpcError:
                     show_callback_screen(token, chat_id, callback_message, "💼 MINHA CARTEIRA\n\nMonitoramento ativo.", wallet_markup(wallet))
