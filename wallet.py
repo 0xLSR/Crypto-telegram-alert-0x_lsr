@@ -71,6 +71,24 @@ def get_wallet_signatures(address: str, limit: int = 20) -> list[dict[str, Any]]
     return [item for item in result if isinstance(item, dict) and item.get("signature")]
 
 
+def get_token_balance(address: str, mint: str) -> tuple[Decimal, int]:
+    """Read the SPL/Token-2022 balance for one mint without scanning market APIs."""
+    total = Decimal(0)
+    decimals = 0
+    for program_id in TOKEN_PROGRAMS:
+        result = solana_rpc("getTokenAccountsByOwner", [address, {"programId": program_id},
+                                                          {"encoding": "jsonParsed", "commitment": "confirmed"}])
+        if not isinstance(result, dict) or not isinstance(result.get("value"), list):
+            raise WalletRpcError("O Solana RPC retornou contas de tokens em formato inválido.")
+        for account in result["value"]:
+            if isinstance(account, dict):
+                parsed = _token_amount(account)
+                if parsed and parsed[0] == mint:
+                    _, amount, decimals = parsed
+                    total += amount
+    return total, decimals
+
+
 def get_wallet_transaction(signature: str) -> dict[str, Any] | None:
     result = solana_rpc("getTransaction", [signature, {"encoding": "jsonParsed", "commitment": "confirmed", "maxSupportedTransactionVersion": 0}])
     return result if isinstance(result, dict) else None
@@ -190,6 +208,11 @@ def get_wallet_info(address: str, market_data: Callable[[str], dict[str, Any] | 
             "symbol": base.get("symbol") or "",
             "price_usd": str(price) if price is not None else None,
             "value_usd": str(amount * price) if price is not None else None,
+            "market_cap": (pair or {}).get("marketCap"),
+            "fdv": (pair or {}).get("fdv"),
+            "liquidity_usd": ((pair or {}).get("liquidity") or {}).get("usd"),
+            "volume_24h": ((pair or {}).get("volume") or {}).get("h24"),
+            "price_change_24h": ((pair or {}).get("priceChange") or {}).get("h24"),
         })
 
     sol_value = sol * sol_price if sol_price is not None else None

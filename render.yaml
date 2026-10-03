@@ -20,6 +20,16 @@ services:
         value: "10"
       - key: ALERT_COOLDOWN_MINUTES
         value: "30"
+      - key: INTELLIGENCE_ENABLED
+        value: "true"
+      - key: INTELLIGENCE_INTERVAL_SECONDS
+        value: "60"
+      - key: HISTORY_RETENTION_HOURS
+        value: "24"
+      - key: MIN_INTELLIGENCE_SCORE
+        value: "75"
+      - key: SMART_ALERTS_ENABLED
+        value: "true"
       - key: BOT_STATE_FILE
         value: /var/data/state.json
     disk:

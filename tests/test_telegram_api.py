@@ -180,7 +180,9 @@ class TelegramCommandTests(unittest.TestCase):
         for command in ("/price", "/watch", "/unwatch", "/list", "/help"):
             self.assertNotIn(command, text)
         labels = [button["text"] for row in markup["inline_keyboard"] for button in row]
-        self.assertEqual(labels, ["💰 Consultar preço", "🔔 Meus alertas", "➕ Adicionar token", "📋 Minha lista", "💼 Minha carteira", "ℹ️ Ajuda"])
+        self.assertEqual(labels, ["💰 Consultar preço", "🔔 Meus alertas", "➕ Adicionar token", "📋 Minha lista",
+                                  "🔎 Scanner", "🧠 Analisar token", "🔥 Oportunidades", "📈 Setup de entrada",
+                                  "🚨 Setup de saída", "📊 Performance", "💼 Minha carteira", "ℹ️ Ajuda"])
 
     def test_menu_alerts_list_and_back_callbacks_edit_same_message_and_answer_every_callback(self):
         state = {"watches": {

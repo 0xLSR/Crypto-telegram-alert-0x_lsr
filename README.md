@@ -2,7 +2,7 @@
 
 Bot de alertas Telegram para tokens Solana, usando primeiro a API pública do [GeckoTerminal](https://api.geckoterminal.com/docs/index.html) e [DexScreener](https://docs.dexscreener.com/api/reference) como fallback. O GitHub Actions inicia o polling automaticamente a cada seis horas e também permite execução manual. Para execução realmente contínua sem reiniciar manualmente, use o Background Worker do Render descrito abaixo.
 
-## Comandos e menus interativos
+## Fase 1 — Alertas e consultas de tokens
 
 - `/start`: menu principal em português com botões para consultar preço, alertas, adicionar token, lista e ajuda.
 - `/help`: guia rápido em português e comandos de compatibilidade.
@@ -22,6 +22,28 @@ Se essa for a carteira que você usa no FOMO, informe o endereço público dela.
 A carteira é consultada por RPC público Solana para saldo SOL, contas de tokens SPL e assinaturas recentes. Movimentações aparecem como **🔄 Movimentação detectada** porque RPC público não prova com segurança se uma operação foi compra, venda, swap ou transferência. Os alertas incluem link Solscan; valores USD de tokens usam as fontes de mercado já existentes quando há cotação e, nos demais casos, aparecem como indisponíveis. PnL fica indisponível nesta versão. O histórico mantém até 20 movimentações por carteira.
 
 Nenhuma nova Secret é necessária. `SOLANA_RPC_URL` é opcional e usa `https://api.mainnet-beta.solana.com` por padrão; `WALLET_CHECK_INTERVAL_SECONDS` é opcional e vale `60` segundos por padrão (aceita de 15 a 3600). Preços USD usam GeckoTerminal e o fallback DexScreener já configurados no bot.
+
+## Inteligência de mercado — Fase 3 somente analítica
+
+O menu `/start` agora inclui **Scanner**, **Analisar token**, **Oportunidades**, **Setup de entrada**, **Setup de saída** e **Performance**. Também é possível enviar `/analisar <endereço>`, `/scanner`, `/oportunidades`, `/entrada`, `/saida` ou `/performance`. Scanner e oportunidades usam os tokens monitorados pelo chat e, quando existe uma carteira pública cadastrada, seus tokens com saldo e cotação disponível. O resultado da consulta da carteira fica em cache por dois minutos; o scanner não faz crawling do mercado.
+
+O módulo separado `market_intelligence.py` guarda snapshots dos tokens monitorados junto com o ciclo de preços existente: timestamp, preço, volume 24h, market cap, FDV, liquidez e variação 24h. O histórico respeita `HISTORY_RETENTION_HOURS` (padrão 24 h) e sobrevive às reinicializações porque fica dentro de `data/state.json`, que o Actions já restaura e salva em cache. A coleta não dispara consultas extras às fontes de mercado.
+
+A análise combina retornos observados, aceleração de preço e volume quando há amostras, estrutura recente, liquidez, volatilidade e relação volume/market cap. Ela apresenta score de confluência (0–100), Entry Score, Exit Risk, estado de mercado, confiança de cobertura dos dados, possível entrada tardia, rompimentos, pullbacks, perda de suporte e resultados observados após sinais para horizontes futuros. A confiança indica cobertura/qualidade dos dados, **não** probabilidade de lucro. Os sinais inteligentes só notificam mudanças relevantes de estado e respeitam o cabeçalho curto de alerta.
+
+Níveis de entrada, invalidação e resistência/TP1 só aparecem quando derivados da amostra histórica; TP2 permanece indisponível enquanto não houver uma resistência observada confiável. Uma amostra curta mostra “Dados insuficientes” e não entra em Oportunidades. Sem fonte confiável, o modelo não estima holders, concentração ou idade do token. Tokens vistos apenas na carteira começam sem histórico próprio e têm baixa confiança até serem acompanhados por snapshots. As leituras de posição são somente saldos públicos e valor atual; PnL não é estimado sem custo de aquisição confiável. As classificações e limiares são heurísticas experimentais, não aconselhamento financeiro nem previsão.
+
+Tudo é read-only. A inteligência não pede chaves, não assina transações e não executa compra, venda ou swap. GeckoTerminal continua como fonte principal, com DexScreener como fallback; se ambas falharem, o bot informa indisponibilidade em vez de gerar um sinal novo.
+
+Variáveis de configuração (todas opcionais; os padrões também são aplicados se não forem definidas):
+
+| Variável | Padrão | Uso |
+| --- | --- | --- |
+| `INTELLIGENCE_ENABLED` | `true` | Coleta snapshots e habilita análise. |
+| `INTELLIGENCE_INTERVAL_SECONDS` | `60` | Intervalo mínimo entre snapshots; reutiliza o ciclo de preço, sem polling extra. |
+| `HISTORY_RETENTION_HOURS` | `24` | Retenção do histórico local (1–720 h). |
+| `MIN_INTELLIGENCE_SCORE` | `75` | Score mínimo exibido em Oportunidades. |
+| `SMART_ALERTS_ENABLED` | `true` | Envia alertas em mudanças relevantes de estado. |
 
 O limiar é configurado por `ALERT_THRESHOLD_PERCENT` (padrão 10%) e o intervalo mínimo entre alertas por token por `ALERT_COOLDOWN_MINUTES` (padrão 30). A verificação de mercado ocorre a cada minuto por padrão e só consulta as APIs quando há tokens acompanhados. A API de token do GeckoTerminal inclui os pools principais; o monitor consulta em lotes de até 30 endereços. A variação de 24h é lida do pool com maior liquidez. Se a consulta falhar, o bot tenta DexScreener. A indisponibilidade das duas fontes não interrompe o polling do Telegram. Endereços são validados como chaves públicas Solana Base58 de 32 bytes.
 
@@ -79,6 +101,6 @@ O estado local é `data/state.json`. Em produção, o Blueprint aponta para o di
 ## Testes
 
 ```sh
-python -m py_compile bot.py tests/test_telegram_api.py
+python -m py_compile bot.py wallet.py market_intelligence.py tests/test_telegram_api.py tests/test_wallet.py tests/test_market_intelligence.py
 python -m unittest discover -s tests -v
 ```

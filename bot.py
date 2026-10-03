@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any
 
 import wallet as solana_wallet
+import market_intelligence as intelligence
 
 API_BASE = "https://api.telegram.org/bot{token}/{method}"
 GECKO_BASE = "https://api.geckoterminal.com/api/v2"
@@ -34,7 +35,23 @@ try:
 except ValueError:
     WALLET_CHECK_INTERVAL_SECONDS = 60
 MAX_WATCHES = 100
+INTELLIGENCE_ENABLED = os.getenv("INTELLIGENCE_ENABLED", "true").strip().lower() not in {"0", "false", "no", "off"}
+SMART_ALERTS_ENABLED = os.getenv("SMART_ALERTS_ENABLED", "true").strip().lower() not in {"0", "false", "no", "off"}
+try:
+    INTELLIGENCE_INTERVAL_SECONDS = max(15, min(3600, int(os.getenv("INTELLIGENCE_INTERVAL_SECONDS", "60"))))
+except ValueError:
+    INTELLIGENCE_INTERVAL_SECONDS = 60
+try:
+    HISTORY_RETENTION_HOURS = max(1, min(720, int(os.getenv("HISTORY_RETENTION_HOURS", "24"))))
+except ValueError:
+    HISTORY_RETENTION_HOURS = 24
+try:
+    MIN_INTELLIGENCE_SCORE = max(0, min(100, int(os.getenv("MIN_INTELLIGENCE_SCORE", "75"))))
+except ValueError:
+    MIN_INTELLIGENCE_SCORE = 75
 PRICE_LOOKUPS: dict[str, str] = {}
+INTELLIGENCE_WALLET_CACHE: dict[str, tuple[float, list[dict[str, Any]]]] = {}
+INTELLIGENCE_MARKET_CACHE: dict[str, tuple[float, dict[str, Any] | None]] = {}
 LOG = logging.getLogger("crypto_alert_bot")
 STATE_LOCK = threading.RLock()
 STOP = threading.Event()
@@ -94,6 +111,8 @@ def is_valid_solana_address(value: str) -> bool:
 
 COMMAND_ALIASES = {"/preço": "/price", "/add": "/watch", "/lista": "/list", "/remove": "/unwatch"}
 COMMAND_ALIASES.update({"/preco": "/price", "/monitorar": "/watch", "/adicionar": "/watch", "/remover": "/unwatch"})
+COMMAND_ALIASES.update({"/analisar": "/analyze", "/analise": "/analyze", "/oportunidades": "/opportunities",
+                        "/entrada": "/entry", "/saida": "/exit", "/scanner": "/scanner", "/performance": "/performance"})
 
 
 def parse_message(text: str) -> tuple[str | None, str]:
@@ -131,7 +150,8 @@ def env_float(name: str, default: float, minimum: float, maximum: float) -> floa
 
 def load_state() -> dict[str, Any]:
     if not STATE_FILE.exists():
-        return {"offset": 0, "watches": {}, "awaiting_add": {}, "pending_add": {}, "wallets": {}, "awaiting_wallet": {}}
+        return {"offset": 0, "watches": {}, "awaiting_add": {}, "pending_add": {}, "wallets": {}, "awaiting_wallet": {},
+                "market_history": {}, "signals": []}
     try:
         value = json.loads(STATE_FILE.read_text(encoding="utf-8"))
         if not isinstance(value, dict) or not isinstance(value.get("watches", {}), dict):
@@ -212,11 +232,50 @@ def load_state() -> dict[str, Any]:
         if not isinstance(awaiting_wallet, dict):
             awaiting_wallet = {}
         safe_awaiting_wallet = {str(user_id): str(chat_id) for user_id, chat_id in awaiting_wallet.items() if str(user_id).isdigit()}
+        raw_history = value.get("market_history", {})
+        if not isinstance(raw_history, dict):
+            raw_history = {}
+        market_history: dict[str, list[dict[str, Any]]] = {}
+        cutoff = time.time() - HISTORY_RETENTION_HOURS * 3600
+        for address, rows in raw_history.items():
+            if not is_valid_solana_address(address) or not isinstance(rows, list):
+                continue
+            safe_rows = []
+            for row in rows[-int(HISTORY_RETENTION_HOURS * 3600 / 15):]:
+                if not isinstance(row, dict):
+                    continue
+                timestamp = intelligence.number(row.get("timestamp"))
+                price = intelligence.number(row.get("price"))
+                if timestamp is None or price is None or price <= 0 or timestamp < cutoff:
+                    continue
+                safe_rows.append({key: intelligence.number(row.get(key)) for key in
+                                  ("timestamp", "price", "volume_24h", "market_cap", "fdv", "liquidity", "price_change_24h")})
+            if safe_rows:
+                market_history[address] = safe_rows[-intelligence.MAX_SNAPSHOTS_PER_TOKEN:]
+        raw_signals = value.get("signals", [])
+        signals = []
+        if isinstance(raw_signals, list):
+            for signal_item in raw_signals[-500:]:
+                if not isinstance(signal_item, dict) or not is_valid_solana_address(signal_item.get("address")):
+                    continue
+                timestamp = intelligence.number(signal_item.get("timestamp"))
+                price = intelligence.number(signal_item.get("price"))
+                if timestamp is None or price is None or price <= 0:
+                    continue
+                signals.append({"address": signal_item["address"], "timestamp": timestamp, "price": price,
+                                "score": signal_item.get("score"), "entry_score": signal_item.get("entry_score"),
+                                "exit_risk": signal_item.get("exit_risk"), "state": str(signal_item.get("state", ""))[:80],
+                                "entry_type": str(signal_item.get("entry_type", ""))[:100],
+                                "outcomes": signal_item.get("outcomes", {}) if isinstance(signal_item.get("outcomes"), dict) else {},
+                                "max_after": intelligence.number(signal_item.get("max_after")) or price,
+                                "min_after": intelligence.number(signal_item.get("min_after")) or price})
         return {"offset": offset, "watches": watches, "awaiting_add": awaiting_add, "pending_add": clean_pending,
-                "wallets": wallets, "awaiting_wallet": safe_awaiting_wallet}
+                "wallets": wallets, "awaiting_wallet": safe_awaiting_wallet,
+                "market_history": market_history, "signals": signals}
     except (OSError, json.JSONDecodeError, ValueError) as exc:
         LOG.error("Estado salvo inválido ou inacessível; iniciando sem offset avançado e sem watches: %s", exc)
-        return {"offset": 0, "watches": {}, "awaiting_add": {}, "pending_add": {}, "wallets": {}, "awaiting_wallet": {}}
+        return {"offset": 0, "watches": {}, "awaiting_add": {}, "pending_add": {}, "wallets": {}, "awaiting_wallet": {},
+                "market_history": {}, "signals": []}
 
 
 def save_state(state: dict[str, Any]) -> None:
@@ -765,6 +824,9 @@ def main_menu_markup() -> dict[str, Any]:
     return {"inline_keyboard": [
         [button("💰 Consultar preço", "price_menu"), button("🔔 Meus alertas", "alerts")],
         [button("➕ Adicionar token", "add_begin"), button("📋 Minha lista", "watch_list")],
+        [button("🔎 Scanner", "intel_scanner"), button("🧠 Analisar token", "intel_analyze_menu")],
+        [button("🔥 Oportunidades", "intel_opportunities"), button("📈 Setup de entrada", "intel_entry_menu")],
+        [button("🚨 Setup de saída", "intel_exit_menu"), button("📊 Performance", "intel_performance")],
         [button("💼 Minha carteira", "wallet_menu")],
         [button("ℹ️ Ajuda", "help")],
     ]}
@@ -844,7 +906,292 @@ def remove_menu_markup(state: dict[str, Any], chat_id: int | str, page: int = 0)
 def start_text() -> str:
     return ("🚀 0x_LSR CRYPTO ALERTS\n\nSeu painel de tokens Solana\n\n"
             "━━━━━━━━━━━━━━━━━━━━\n\n"
-            "💰 Consultar preço\n🔔 Meus alertas\n➕ Adicionar token\n📋 Minha lista\n\nℹ️ Ajuda")
+            "💰 Consultar preço\n🔔 Meus alertas\n➕ Adicionar token\n📋 Minha lista\n\n"
+            "🧠 INTELIGÊNCIA\n🔎 Scanner · 🧠 Analisar token\n🔥 Oportunidades · 📈 Setup de entrada · 🚨 Setup de saída\n\n"
+            "💼 Minha carteira · 📊 Performance\n\nℹ️ Ajuda")
+
+
+def intelligence_token_markup(entries: list[dict[str, Any]], action: str) -> dict[str, Any]:
+    rows = []
+    for entry in entries[:100]:
+        address = entry.get("address")
+        if not is_valid_solana_address(address):
+            continue
+        symbol = entry.get("symbol") or entry.get("name") or "TOKEN"
+        rows.append([button(f"{symbol}"[:64], f"{action}:{address}")])
+    rows.append([button("◀️ Voltar", "menu")])
+    return {"inline_keyboard": rows}
+
+
+def intelligence_pair(entry: dict[str, Any], snapshots: list[dict[str, Any]]) -> dict[str, Any] | None:
+    latest = snapshots[-1] if snapshots else {}
+    price = latest.get("price", entry.get("last_price"))
+    if not price:
+        return None
+    return {"priceUsd": str(price), "baseToken": {"address": entry.get("address"),
+            "symbol": entry.get("symbol"), "name": entry.get("name")},
+            "priceChange": {"h24": latest.get("price_change_24h", entry.get("last_change_24h"))},
+            "volume": {"h24": latest.get("volume_24h")}, "marketCap": latest.get("market_cap", entry.get("market_cap")),
+            "fdv": latest.get("fdv", entry.get("fdv")), "liquidity": {"usd": latest.get("liquidity")}}
+
+
+def get_intelligence_market_data(address: str) -> dict[str, Any] | None:
+    cached = INTELLIGENCE_MARKET_CACHE.get(address)
+    now = time.monotonic()
+    if cached and now - cached[0] < 60:
+        return cached[1]
+    pair = get_market_data(address)
+    INTELLIGENCE_MARKET_CACHE[address] = (now, pair)
+    return pair
+
+
+def intelligence_analysis_text(address: str, entry: dict[str, Any], result: dict[str, Any],
+                               pair: dict[str, Any] | None, mode: str = "analysis") -> str:
+    base = (pair or {}).get("baseToken") or {}
+    label = base.get("symbol") or base.get("name") or entry.get("symbol") or entry.get("name") or "TOKEN"
+    metrics = result.get("metrics", {})
+    score = result.get("score")
+    entry_score = result.get("entry_score")
+    exit_risk = result.get("exit_risk")
+    confidence = result.get("confidence", 0)
+    if mode == "entry":
+        title = "📈 SETUP DE ENTRADA"
+    elif mode == "exit":
+        title = "🚨 RISCO DE SAÍDA"
+    else:
+        title = "🧠 ANÁLISE"
+    lines = [title, "", str(label), f"\n💰 Preço: {money((pair or {}).get('priceUsd') or metrics.get('price'))}"]
+    if metrics.get("market_cap") is not None:
+        lines.append(f"📊 Market Cap: {compact(metrics['market_cap'])}")
+    if metrics.get("liquidity") is not None:
+        lines.append(f"💧 Liquidez: {compact(metrics['liquidity'])}")
+    if metrics.get("volume_24h") is not None:
+        lines.append(f"📊 Volume 24h: {compact(metrics['volume_24h'])}")
+    change = (pair or {}).get("priceChange", {}).get("h24")
+    if change is not None:
+        lines.append(f"📈 24h: {signed_percent(change)}")
+    lines += ["", "━━━━━━━━━━━━━━━━━━━━", "", f"🧠 Estado: {result.get('state', '⚪ SEM DADOS')}",
+              f"Score: {score if score is not None else '—'}/100"]
+    if score is not None:
+        score_label = ("🚨 Excepcional" if score >= 90 else "🔥 Forte" if score >= 80 else
+                       "🟢 Interessante" if score >= 65 else "🟡 Neutro" if score >= 50 else
+                       "🟠 Baixo" if score >= 30 else "🔴 Fraco")
+        lines.append(score_label)
+    if entry_score is not None:
+        entry_label = ("🚨 Excepcional" if entry_score >= 90 else "🔥 Forte" if entry_score >= 80 else
+                       "🟢 Interessante" if entry_score >= 65 else "🟡 Neutro" if entry_score >= 50 else
+                       "🟠 Baixo" if entry_score >= 30 else "🔴 Fraco")
+        lines.append(f"Entry Score: {entry_score}/100 · {entry_label}")
+    if exit_risk is not None:
+        lines.append(f"Exit Risk: {exit_risk}/100")
+        exit_label = ("🚨 Estrutura deteriorada" if exit_risk >= 85 else "🔴 Risco elevado" if exit_risk >= 70 else
+                      "🟠 Risco crescente" if exit_risk >= 50 else "🟡 Atenção" if exit_risk >= 30 else "🟢 Estrutura saudável")
+        exit_action = ("🔴 Saída/invalidação a considerar" if exit_risk >= 70 else
+                       "🟠 Reduzir risco" if exit_risk >= 50 else "🟡 Atenção" if exit_risk >= 30 else "🟢 Segurar / estrutura saudável")
+        lines.extend([exit_label, exit_action])
+    lines.append(f"Confiança dos dados: {confidence}% (não representa probabilidade de lucro)")
+    component_names = {"momentum": "Momentum", "volume": "Volume", "structure": "Estrutura",
+                       "liquidity": "Liquidez", "volatility": "Volatilidade", "volume_acceleration": "Aceleração de volume",
+                       "price_acceleration": "Aceleração de preço", "turnover": "Volume / market cap",
+                       "market_cap": "Market cap", "fdv_overhang": "Relação FDV / market cap",
+                       "consistency": "Consistência do movimento"}
+    if result.get("components"):
+        lines.append("\nComponentes disponíveis:")
+        lines.extend(f"• {component_names.get(key, key)}: {round(value)}/100" for key, value in result["components"].items())
+    for label_key, metric_key in (("5m", "5m"), ("15m", "15m"), ("30m", "30m"), ("1h", "1h"), ("4h", "4h"), ("24h", "24h")):
+        value = metrics.get("return_" + metric_key)
+        if value is not None:
+            lines.append(f"{label_key}: {signed_percent(value)}")
+    if result.get("insufficient"):
+        lines.append("\n⏳ Dados insuficientes para análise completa.")
+    entry_setup = result.get("entry", {})
+    lines += ["\n━━━━━━━━━━━━━━━━━━━━", "", f"📈 Setup: {entry_setup.get('type', 'Dados insuficientes')}"]
+    zone = entry_setup.get("zone")
+    if zone:
+        lines.append(f"📍 Zona observada: {money(zone[0])} — {money(zone[1])}")
+    if entry_setup.get("confirmation") is not None:
+        lines.append(f"✅ Confirmação observada: {money(entry_setup['confirmation'])}")
+    if entry_setup.get("invalidation") is not None:
+        lines.append(f"🛑 Invalidação (mínima recente): {money(entry_setup['invalidation'])}")
+    if entry_setup.get("tp1") is not None:
+        lines.append(f"🎯 Resistência/TP1 observada: {money(entry_setup['tp1'])}")
+        if entry_setup.get("risk_reward") is not None:
+            lines.append(f"📐 R/R até TP1: 1:{entry_setup['risk_reward']:.2f}")
+    else:
+        lines.append("🎯 Alvos: dados insuficientes para níveis observados confiáveis.")
+    if entry_setup.get("late"):
+        lines += ["\n⚠️ ENTRADA TARDIA", "Movimento estendido; considere aguardar consolidação/pullback."]
+    if result.get("exit_signals"):
+        lines += ["\n⚠️ Riscos:"] + ["• " + reason for reason in result["exit_signals"]]
+    elif metrics.get("liquidity") is not None and metrics["liquidity"] < intelligence.MIN_LIQUIDITY_USD:
+        lines.append("\n☠️ ALTO RISCO: liquidez muito baixa.")
+    if metrics.get("liquidity") is not None and metrics["liquidity"] >= intelligence.MIN_LIQUIDITY_USD:
+        risk_label = "ALTO" if metrics["liquidity"] < 20_000 or (metrics.get("volatility_pct") or 0) > 20 else "MODERADO"
+        lines.append(f"⚠️ Risco estimado do ativo: {risk_label} (heurística de liquidez/volatilidade).")
+    if result.get("reasons"):
+        lines += ["\nContexto:"] + ["• " + reason for reason in result["reasons"][:4]]
+    if exit_risk is not None and exit_risk >= 70:
+        conclusion = "Estrutura deteriorada; risco de saída elevado, sem instrução automática de venda."
+    elif entry_setup.get("late"):
+        conclusion = "Movimento estendido; risco de entrada tardia e possibilidade de correção."
+    elif result.get("state") == "🔥 BREAKOUT":
+        conclusion = "Rompimento com confluência de volume observado; continuidade não é garantida."
+    elif result.get("state") == "🟢 MOMENTUM":
+        conclusion = "Momentum positivo observado; aguarde confirmação e avalie o risco."
+    else:
+        conclusion = "Sinais mistos ou incompletos; não há confirmação suficiente para um setup forte."
+    lines.append(f"\nConclusão: {conclusion} Score e confiança não são probabilidade de lucro.")
+    return "\n".join(lines)[:3900]
+
+
+def intelligence_scan_text(entries: list[dict[str, Any]], history: dict[str, list[dict[str, Any]]],
+                            *, opportunities: bool = False) -> tuple[str, dict[str, Any]]:
+    ranked = []
+    for entry in entries:
+        address = entry.get("address", "")
+        snapshots = history.get(address, [])
+        pair = entry.get("_market_pair") or intelligence_pair(entry, snapshots)
+        if pair is None:
+            continue
+        latest_timestamp = snapshots[-1].get("timestamp") if snapshots else None
+        result = intelligence.analyze(snapshots, pair, timestamp=latest_timestamp)
+        if result.get("score") is None:
+            continue
+        if opportunities and (result["score"] < MIN_INTELLIGENCE_SCORE or result.get("insufficient")):
+            continue
+        ranked.append((result["score"], entry, pair, result))
+    ranked.sort(key=lambda item: item[0], reverse=True)
+    ranked = ranked[:5]
+    if not ranked:
+        prefix = "🔥 OPORTUNIDADES" if opportunities else "🔎 SCANNER"
+        return (f"{prefix}\n\nNenhum token monitorado tem dados suficientes neste momento.\n"
+                "Adicione tokens à sua lista; o histórico começa a ser coletado pelo monitor normal."), back_markup()
+    heading = "🔥 OPORTUNIDADES" if opportunities else "🔎 SCANNER"
+    lines = [heading, "", "Ativos monitorados com maior confluência segundo o modelo. Não são recomendações de investimento.", ""]
+    rows = []
+    for index, (score, entry, pair, result) in enumerate(ranked, 1):
+        base = pair.get("baseToken") or {}
+        name = base.get("symbol") or base.get("name") or "TOKEN"
+        lines.append(f"{index}. {name} · Score {score}/100 · {result['state']} · confiança {result['confidence']}%")
+        if result.get("insufficient"):
+            lines.append("⏳ Histórico insuficiente; não entra em Oportunidades.")
+        if pair.get("marketCap") is not None:
+            lines.append(f"MC {compact(pair['marketCap'])}")
+        if (pair.get("priceChange") or {}).get("h24") is not None:
+            lines.append(f"24h {signed_percent(pair['priceChange']['h24'])}")
+        rows.append([button(f"🧠 {name}"[:64], f"ia:{entry['address']}"),
+                     button("📈 Setup", f"ie:{entry['address']}")])
+    rows.append([button("◀️ Voltar", "menu")])
+    return "\n".join(lines)[:3900], {"inline_keyboard": rows}
+
+
+def intelligence_entries_for_chat(state: dict[str, Any], chat_id: int | str, user_id: str | None = None) -> list[dict[str, Any]]:
+    """Use the existing watchlist and read-only wallet lookup; never crawl external token lists."""
+    entries = watch_entries(state, chat_id)
+    if not INTELLIGENCE_ENABLED or not user_id or not user_id.isdigit():
+        return entries
+    tracked_wallet = current_wallet(state, user_id, chat_id)
+    if not tracked_wallet:
+        return entries
+    wallet_address = tracked_wallet["address"]
+    now = time.monotonic()
+    cached = INTELLIGENCE_WALLET_CACHE.get(wallet_address)
+    if cached and now - cached[0] < 120:
+        wallet_tokens = cached[1]
+    else:
+        try:
+            info = solana_wallet.get_wallet_info(wallet_address, get_market_data, get_gecko_pairs)
+            wallet_tokens = []
+            for item in info.get("tokens", []):
+                if not item.get("price_usd") or not is_valid_solana_address(item.get("mint")):
+                    continue
+                wallet_tokens.append({
+                    "mint": item["mint"], "name": item.get("name"), "symbol": item.get("symbol"),
+                    "amount": item.get("amount"), "_market_pair": {
+                        "priceUsd": item["price_usd"],
+                        "baseToken": {"address": item["mint"], "name": item.get("name"), "symbol": item.get("symbol")},
+                        "marketCap": item.get("market_cap"), "fdv": item.get("fdv"),
+                        "liquidity": {"usd": item.get("liquidity_usd")},
+                        "volume": {"h24": item.get("volume_24h")},
+                        "priceChange": {"h24": item.get("price_change_24h")},
+                    },
+                })
+                INTELLIGENCE_MARKET_CACHE[item["mint"]] = (now, wallet_tokens[-1]["_market_pair"])
+            INTELLIGENCE_WALLET_CACHE[wallet_address] = (now, wallet_tokens)
+        except solana_wallet.WalletRpcError as exc:
+            LOG.info("[WALLET] Scanner sem saldos por falha RPC: %s", exc)
+            INTELLIGENCE_WALLET_CACHE[wallet_address] = (now, [])
+            wallet_tokens = []
+    known = {entry.get("address") for entry in entries}
+    entries.extend({"address": item["mint"], "symbol": item.get("symbol"), "name": item.get("name"),
+                    "subscribers": [str(chat_id)], "_market_pair": item["_market_pair"]}
+                   for item in wallet_tokens if item["mint"] not in known)
+    return entries
+
+
+def intelligence_single_screen(state: dict[str, Any], chat_id: int | str, address: str,
+                               mode: str = "analysis", user_id: str | None = None) -> tuple[str, dict[str, Any]]:
+    if not INTELLIGENCE_ENABLED:
+        return "🧠 Inteligência está desativada nesta execução.", back_markup()
+    if not is_valid_solana_address(address):
+        return "Informe um endereço Solana válido para análise.", back_markup()
+    entry = state.get("watches", {}).get(address)
+    if entry and str(chat_id) not in entry.get("subscribers", []):
+        entry = None
+    entry = dict(entry or {"address": address, "symbol": "", "name": "TOKEN"})
+    pair = get_intelligence_market_data(address)
+    if not pair:
+        return "⚠️ Dados de mercado indisponíveis.", back_markup()
+    history = state.setdefault("market_history", {}).get(address, [])
+    result = intelligence.analyze(history, pair)
+    text = intelligence_analysis_text(address, entry, result, pair, mode)
+    if user_id and user_id.isdigit():
+        tracked_wallet = current_wallet(state, user_id, chat_id)
+        if tracked_wallet:
+            try:
+                amount, _decimals = solana_wallet.get_token_balance(tracked_wallet["address"], address)
+                if amount > 0:
+                    price = intelligence.number(pair.get("priceUsd"))
+                    value = amount * Decimal(str(price)) if price is not None else None
+                    text += (f"\n\n💼 SUA POSIÇÃO\nQuantidade: {wallet_amount(amount)}\n"
+                             f"Valor: {wallet_usd(value) if value is not None else 'indisponível'}\n"
+                             "PnL: indisponível (não há custo de aquisição confiável).")
+            except solana_wallet.WalletRpcError as exc:
+                LOG.info("[WALLET] Posição da carteira indisponível para análise: %s", exc)
+    rows = [[button("🧠 Analisar", f"ia:{address}"), button("📈 Entrada", f"ie:{address}"),
+             button("🚨 Saída", f"ix:{address}")],
+            [button("💼 Minha posição", f"ip:{address}")],
+            [button("💰 Preço", f"p:{token_callback_id(address)}"), button("◀️ Voltar", "intel_analyze_menu")]]
+    PRICE_LOOKUPS[token_callback_id(address)] = address
+    return text, {"inline_keyboard": rows}
+
+
+def intelligence_performance_text(state: dict[str, Any], chat_id: int | str) -> str:
+    addresses = {entry.get("address") for entry in watch_entries(state, chat_id)}
+    records = [item for item in state.get("signals", []) if item.get("address") in addresses]
+    if not records:
+        return ("📊 PERFORMANCE DO MODELO\n\nAinda não há sinais históricos para os tokens deste chat.\n"
+                "A coleta começa junto com os snapshots do monitor. Não há alegação de desempenho sem amostra.")
+    counts: dict[str, int] = {}
+    for item in records:
+        counts[item.get("state", "⚪ SEM DADOS")] = counts.get(item.get("state", "⚪ SEM DADOS"), 0) + 1
+    lines = ["📊 PERFORMANCE DO MODELO", "", f"Sinais registrados: {len(records)}", "Contexto descritivo; não é backtest validado.", ""]
+    lines.extend(f"{state_name}: {count}" for state_name, count in sorted(counts.items()))
+    for horizon in ("5m", "15m", "1h", "4h"):
+        outcomes = [item.get("outcomes", {}).get(horizon) for item in records
+                    if isinstance(item.get("outcomes"), dict) and item.get("outcomes", {}).get(horizon) is not None]
+        if outcomes:
+            lines.append(f"\nApós {horizon}: {len(outcomes)} observações · média {signed_percent(sum(outcomes) / len(outcomes))}")
+    watch_names = {entry.get("address"): entry.get("symbol") or entry.get("name") or "TOKEN"
+                   for entry in watch_entries(state, chat_id)}
+    lines.append("\nSinais recentes:")
+    for item in reversed(records[-10:]):
+        timestamp = item.get("timestamp")
+        date_text = time.strftime("%d/%m %H:%M", time.localtime(timestamp)) if isinstance(timestamp, (int, float)) else "data indisponível"
+        signal_score = item.get("score")
+        lines.append(f"• {watch_names.get(item.get('address'), 'TOKEN')} · {date_text} · {item.get('state', '⚪ SEM DADOS')} · {signal_score if signal_score is not None else '—'}/100")
+    lines.append("\nResultados passados não garantem resultados futuros.")
+    return "\n".join(lines)[:3900]
 
 
 def change_icon(value: Any) -> str:
@@ -927,13 +1274,14 @@ def help_text() -> str:
     return ("ℹ️ AJUDA\n\n🚀 Este bot permite:\n\n"
         "💰 Consultar preços de tokens Solana\n🔔 Criar alertas de variação\n"
         "📋 Gerenciar sua lista de tokens\n📊 Acompanhar dados de mercado\n"
-        "💼 Consultar uma carteira Solana pública\n\n"
+        "💼 Consultar uma carteira Solana pública\n🧠 Análise técnica experimental baseada no histórico coletado pelo bot\n\n"
         "Como usar:\n\n1️⃣ Toque em \"Consultar preço\"\n2️⃣ Escolha um token\n"
         "3️⃣ Para adicionar outro, toque em \"Adicionar token\"\n"
         "4️⃣ Para acompanhar uma carteira pública, toque em \"Minha carteira\"\n\n"
         "Comandos disponíveis:\n/start — abrir o menu\n/price — consultar preço\n"
         "/list — minha lista\n/watch — adicionar alerta\n/unwatch — remover alerta\n/help — ajuda\n\n"
-        "Os comandos ficam apenas como referência técnica.")
+        "/analisar <endereço> — análise de mercado\n\n"
+        "Os comandos ficam apenas como referência técnica. A inteligência é somente analítica, não executa operações e não garante resultados.")
 
 
 MARKET_UNAVAILABLE = "Não consegui consultar o preço agora. As fontes de mercado estão temporariamente indisponíveis. Tente novamente em alguns segundos."
@@ -1156,13 +1504,39 @@ def handle_update(update: dict[str, Any], state: dict[str, Any], token: str, thr
                     send_message(token, chat_id, "Monitoramento removido.")
             elif command == "/list":
                 send_watch_list(token, chat_id, state, threshold)
+            elif command == "/analyze":
+                if not INTELLIGENCE_ENABLED:
+                    send_message(token, chat_id, "🧠 Inteligência está desativada nesta execução.", back_markup())
+                elif not arg:
+                    entries = intelligence_entries_for_chat(state, chat_id, user_id)
+                    send_message(token, chat_id, "🧠 ANALISAR TOKEN\n\nEscolha um token monitorado:",
+                                 intelligence_token_markup(entries, "ia"))
+                else:
+                    text, markup = intelligence_single_screen(state, chat_id, arg, user_id=user_id)
+                    send_message(token, chat_id, text, markup)
+            elif command in {"/scanner", "/opportunities"}:
+                if not INTELLIGENCE_ENABLED:
+                    text, markup = "🧠 Inteligência está desativada nesta execução.", back_markup()
+                else:
+                    text, markup = intelligence_scan_text(intelligence_entries_for_chat(state, chat_id, user_id), state.setdefault("market_history", {}),
+                                                           opportunities=command == "/opportunities")
+                send_message(token, chat_id, text, markup)
+            elif command in {"/entry", "/exit"}:
+                entries = intelligence_entries_for_chat(state, chat_id, user_id)
+                title = "📈 SETUP DE ENTRADA" if command == "/entry" else "🚨 SETUP DE SAÍDA"
+                action = "ie" if command == "/entry" else "ix"
+                text = (f"{title}\n\nEscolha um token monitorado:" if INTELLIGENCE_ENABLED
+                        else "🧠 Inteligência está desativada nesta execução.")
+                send_message(token, chat_id, text, intelligence_token_markup(entries, action) if INTELLIGENCE_ENABLED else back_markup())
+            elif command == "/performance":
+                send_message(token, chat_id, intelligence_performance_text(state, chat_id), back_markup())
             else:
                 send_message(token, chat_id, help_text(), main_menu_markup())
         except TelegramError:
             raise
         except MarketDataError as exc:
             LOG.warning("Consulta a fontes de mercado falhou em %s: %s", command, exc)
-            send_message(token, chat_id, MARKET_UNAVAILABLE)
+            send_message(token, chat_id, "⚠️ Dados de mercado indisponíveis." if command in {"/analyze", "/scanner", "/opportunities", "/entry", "/exit"} else MARKET_UNAVAILABLE)
         except BotError as exc:
             send_message(token, chat_id, str(exc))
         except Exception as exc:
@@ -1203,6 +1577,26 @@ def handle_callback_update(update: dict[str, Any], state: dict[str, Any], token:
                     state.setdefault("awaiting_wallet", {}).pop(user_id, None)
                 save_state(state)
             show_callback_screen(token, chat_id, callback_message, start_text(), main_menu_markup())
+        elif data in {"intel_scanner", "intel_opportunities"}:
+            if not INTELLIGENCE_ENABLED:
+                text, markup = "🧠 Inteligência está desativada nesta execução.", back_markup()
+            else:
+                text, markup = intelligence_scan_text(intelligence_entries_for_chat(state, chat_id, user_id), state.setdefault("market_history", {}),
+                                                       opportunities=data == "intel_opportunities")
+            show_callback_screen(token, chat_id, callback_message, text, markup)
+        elif data in {"intel_analyze_menu", "intel_entry_menu", "intel_exit_menu"}:
+            action = {"intel_analyze_menu": "ia", "intel_entry_menu": "ie", "intel_exit_menu": "ix"}[data]
+            title = {"ia": "🧠 ANALISAR TOKEN", "ie": "📈 SETUP DE ENTRADA", "ix": "🚨 SETUP DE SAÍDA"}[action]
+            show_callback_screen(token, chat_id, callback_message,
+                                 f"{title}\n\nEscolha um token monitorado:",
+                                 intelligence_token_markup(intelligence_entries_for_chat(state, chat_id, user_id), action))
+        elif data == "intel_performance":
+            show_callback_screen(token, chat_id, callback_message, intelligence_performance_text(state, chat_id), back_markup())
+        elif data.startswith(("ia:", "ie:", "ix:", "ip:")):
+            action, _, address = data.partition(":")
+            mode = {"ia": "analysis", "ie": "entry", "ix": "exit", "ip": "analysis"}[action]
+            text, markup = intelligence_single_screen(state, chat_id, address, mode, user_id)
+            show_callback_screen(token, chat_id, callback_message, text, markup)
         elif data == "wallet_menu":
             wallet = current_wallet(state, user_id, chat_id) if user_id.isdigit() else None
             if not wallet:
@@ -1445,6 +1839,9 @@ def handle_callback_update(update: dict[str, Any], state: dict[str, Any], token:
         raise
     except MarketDataError as exc:
         LOG.warning("Consulta a fontes de mercado falhou no callback: %s", exc)
+        if data.startswith(("ia:", "ie:", "ix:", "ip:")):
+            show_callback_screen(token, chat_id, callback_message, "⚠️ Dados de mercado indisponíveis.", back_markup("intel_analyze_menu"))
+            return
         if data.startswith("l:") or data.endswith(":l"):
             back = "watch_list"
         elif data.startswith("p:") or data.endswith(":p"):
@@ -1508,9 +1905,62 @@ def check_prices(state: dict[str, Any], token: str, threshold: float, cooldown: 
                         entry["anchor_price"] = price
                         continue
                     change = (price / anchor - 1) * 100
+                    smart_notice = None
+                    if INTELLIGENCE_ENABLED:
+                        market_history = state.setdefault("market_history", {})
+                        snapshot = intelligence.append_snapshot(market_history, address, pair, now,
+                                                                HISTORY_RETENTION_HOURS, INTELLIGENCE_INTERVAL_SECONDS)
+                        result = intelligence.analyze(market_history.get(address, []), pair, timestamp=now)
+                        if snapshot:
+                            signals = state.setdefault("signals", [])
+                            intelligence.record_signal(signals, address, result, snapshot)
+                            intelligence.update_signal_outcomes(signals, address, snapshot)
+                        event_states = {"🔥 BREAKOUT", "☠️ ALTO RISCO", "🔴 DISTRIBUIÇÃO"}
+                        event_key = (f"{result.get('state')}|{result.get('entry', {}).get('type')}"
+                                     if result.get("state") in event_states or result.get("entry", {}).get("late") else None)
+                        previous_event = entry.get("last_smart_signal")
+                        if SMART_ALERTS_ENABLED and event_key and event_key != previous_event:
+                            symbol = base.get("symbol") or base.get("name") or "TOKEN"
+                            smart_notice = (list(entry.get("subscribers", [])),
+                                            f"{movement_icon(change)} {signed_percent(change)} • {symbol}\n\n"
+                                            f"🧠 Score: {result.get('score') if result.get('score') is not None else '—'}/100\n"
+                                            f"{result.get('state')}\n"
+                                            f"Setup: {result.get('entry', {}).get('type', 'Dados insuficientes')}\n"
+                                            f"Confiança dos dados: {result.get('confidence', 0)}% · não é probabilidade de lucro.",
+                                            {"inline_keyboard": [[button("🧠 Analisar", f"ia:{address}"),
+                                                                  button("📈 Entrada", f"ie:{address}")],
+                                                                 [button("💼 Minha posição", f"ip:{address}")] ]},
+                                            [(str(uid), dict(wallet_entry)) for uid, wallet_entry in state.get("wallets", {}).items()
+                                             if str(wallet_entry.get("chat_id")) in entry.get("subscribers", [])
+                                             and str(wallet_entry.get("chat_id")) == str(uid)])
+                            entry["last_smart_signal"] = event_key
+                        elif not event_key:
+                            entry["last_smart_signal"] = None
                     if abs(change) < threshold or now - float(entry.get("last_alert", 0)) < cooldown:
-                        continue
-                    subscribers = list(entry.get("subscribers", []))
+                        subscribers = []
+                    else:
+                        subscribers = list(entry.get("subscribers", []))
+                if smart_notice:
+                    smart_subscribers, smart_text, smart_markup, smart_wallets = smart_notice
+                    for chat_id in smart_subscribers:
+                        personalized_text = smart_text
+                        for _wallet_user, wallet_entry in smart_wallets:
+                            if str(wallet_entry.get("chat_id")) != str(chat_id):
+                                continue
+                            try:
+                                amount, _decimals = solana_wallet.get_token_balance(wallet_entry["address"], address)
+                                market_price = Decimal(str(pair["priceUsd"]))
+                                if amount > 0 and market_price.is_finite() and market_price > 0:
+                                    personalized_text += (f"\n\n💼 ALERTA DA SUA CARTEIRA\nSua posição: {wallet_amount(amount)} tokens · "
+                                                         f"{wallet_usd(amount * market_price)}. PnL indisponível sem custo de aquisição confiável.")
+                            except (solana_wallet.WalletRpcError, InvalidOperation, TypeError, ValueError) as exc:
+                                LOG.info("[WALLET] Não foi possível anexar posição ao alerta inteligente: %s", exc)
+                        try:
+                            send_message(token, chat_id, personalized_text, smart_markup)
+                        except TelegramError as exc:
+                            LOG.warning("Telegram não entregou alerta inteligente: %s", exc)
+                if not subscribers:
+                    continue
                 alert_token = base.get("symbol") or base.get("name") or "TOKEN"
                 text = f"{movement_icon(change)} {signed_percent(change)} • {alert_token}\n\n" + pair_summary(pair, alert_change=change)
                 delivered = False

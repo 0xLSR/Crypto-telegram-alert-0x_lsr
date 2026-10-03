@@ -21,6 +21,6 @@ jobs:
         with:
           python-version: "3.12"
       - name: Validate Python syntax
-        run: python -m py_compile bot.py tests/test_telegram_api.py
+        run: python -m py_compile bot.py wallet.py market_intelligence.py tests/test_telegram_api.py tests/test_wallet.py tests/test_market_intelligence.py
       - name: Run tests
         run: python -m unittest discover -s tests -v
