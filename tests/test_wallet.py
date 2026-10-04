@@ -6,6 +6,7 @@ from unittest.mock import patch
 
 import bot
 import wallet
+import nansen_client as nansen
 
 ADDRESS = "So11111111111111111111111111111111111111112"
 MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
@@ -201,6 +202,23 @@ class WalletBotTests(unittest.TestCase):
         self.assertIn("$192.68", edit.call_args.args[3])
         self.assertIn("PnL", edit.call_args.args[3])
 
+    def test_nansen_wallet_screen_shows_exact_ten_holdings_top_and_allocation(self):
+        holdings = [{"mint": f"mint-{i}", "symbol": "SIGF" if i == 0 else f"T{i}",
+                     "name": f"Token {i}", "amount": str(i + 1), "price_usd": "1",
+                     "value_usd": "397.48" if i == 0 else "4.79"} for i in range(10)]
+        info = nansen.normalize_balances(ADDRESS, [{
+            "token_address": item["mint"], "token_symbol": item["symbol"], "token_name": item["name"],
+            "token_amount": item["amount"], "price_usd": item["price_usd"], "value_usd": item["value_usd"],
+        } for item in holdings])
+        info["defi"] = None
+        entry = {"address": ADDRESS, "configured_default": True, "monitoring_enabled": False}
+        text = bot.wallet_info_text(ADDRESS, info, entry, details=True)
+        self.assertIn("Top token: SIGF", text)
+        self.assertIn("1. SIGF", text)
+        self.assertIn("10. T9", text)
+        self.assertIn("10 ativos encontrados", text)
+        self.assertNotIn("rpc-", text)
+
     def test_wallet_screen_shows_partial_estimate_and_paginated_asset_details(self):
         tokens = [{"mint": f"mint-{i}", "amount": "100", "symbol": f"T{i}",
                    "price_usd": "1" if i < 18 else None, "value_usd": "100" if i < 18 else None}
@@ -217,20 +235,23 @@ class WalletBotTests(unittest.TestCase):
         last_page = bot.wallet_info_text(ADDRESS, info, entry, details=True, detail_page=3)
         self.assertIn("1. T0", first_page)
         self.assertIn("6. T5", first_page)
-        self.assertNotIn("7. T6", first_page)
-        self.assertIn("7. T6", second_page)
-        self.assertIn("Preço: indisponível\nValor: indisponível", last_page)
-        self.assertTrue(any("wallet_tokens:1" == b.get("callback_data") for row in bot.wallet_markup(entry, detail_page=0, page_count=4)["inline_keyboard"] for b in row))
+        self.assertIn("10. T9", first_page)
+        self.assertNotIn("11. T10", first_page)
+        self.assertIn("11. T10", second_page)
+        self.assertIn("20. T19", last_page)
+        self.assertIn("Valor: indisponível", last_page)
+        self.assertTrue(any("wallet_tokens:1" == b.get("callback_data") for row in bot.wallet_markup(entry, detail_page=0, page_count=2)["inline_keyboard"] for b in row))
         state = {"watches": {}, "wallets": {"22": entry}}
         with patch.object(bot, "answer_callback"), patch.object(bot, "edit_message") as edit, \
              patch.object(bot.solana_wallet, "get_wallet_info", return_value=info), patch.object(bot, "save_state"):
             bot.handle_callback_update(self.callback("wallet_tokens:1"), state, TOKEN, 10, set())
-        self.assertIn("7. T6", edit.call_args.args[3])
-        self.assertIn("wallet_tokens:2", str(edit.call_args.args[4]))
+        self.assertIn("11. T10", edit.call_args.args[3])
+        self.assertIn("2/2", str(edit.call_args.args[4]))
 
         with patch.object(bot, "answer_callback"), patch.object(bot, "edit_message") as edit:
-            with patch.object(bot.solana_wallet, "get_wallet_info", side_effect=wallet.WalletRpcError("offline")):
+            with patch.object(bot.solana_wallet, "get_wallet_info", side_effect=wallet.WalletRpcError("offline")) as lookup:
                 bot.handle_callback_update(self.callback("wallet_refresh"), state, TOKEN, 10, set())
+        self.assertIs(lookup.call_args.kwargs["force_refresh"], True)
         self.assertIn("Não consegui consultar a blockchain", edit.call_args.args[3])
 
     def test_wallet_history_alert_toggle_and_remove_are_per_user(self):

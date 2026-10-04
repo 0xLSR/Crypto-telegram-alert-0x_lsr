@@ -230,7 +230,7 @@ class MarketIntelligenceTests(unittest.TestCase):
         state = {"watches": {}, "wallets": {"22": {"address": ADDRESS, "chat_id": "11"}},
                  "market_history": {}, "signals": []}
         bot.INTELLIGENCE_WALLET_CACHE.pop(ADDRESS, None)
-        wallet_info = {"tokens": [{"mint": mint, "amount": "5", "name": "USD Coin", "symbol": "USDC",
+        wallet_info = {"source": "nansen", "tokens": [{"mint": mint, "amount": "5", "name": "USD Coin", "symbol": "USDC",
                                     "price_usd": "1", "market_cap": 1000000, "fdv": 1100000,
                                     "liquidity_usd": 500000, "volume_24h": 100000,
                                     "price_change_24h": .1}]}
@@ -243,6 +243,14 @@ class MarketIntelligenceTests(unittest.TestCase):
         self.assertIn("Histórico insuficiente", text)
         opportunity, _ = bot.intelligence_scan_text(entries, {}, opportunities=True)
         self.assertIn("Nenhum token monitorado", opportunity)
+
+    def test_scanner_does_not_treat_rpc_fallback_tokens_as_wallet_positions(self):
+        mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+        state = {"watches": {}, "wallets": {"22": {"address": ADDRESS, "chat_id": "11"}}}
+        bot.INTELLIGENCE_WALLET_CACHE.pop(ADDRESS, None)
+        fallback = {"source": "rpc_fallback", "tokens": [{"mint": mint, "amount": "5", "price_usd": "1"}]}
+        with patch.object(bot.solana_wallet, "get_wallet_info", return_value=fallback):
+            self.assertEqual(bot.intelligence_entries_for_chat(state, 11, "22"), [])
 
 
 if __name__ == "__main__":

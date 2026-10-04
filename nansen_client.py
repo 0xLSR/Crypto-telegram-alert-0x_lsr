@@ -40,7 +40,7 @@ def _request(path: str, body: dict[str, Any], api_key: str,
     request = urllib.request.Request(
         BASE_URL + path, data=json.dumps(body).encode("utf-8"), method="POST",
         headers={"Content-Type": "application/json", "Accept": "application/json",
-                 "apikey": api_key, "User-Agent": "crypto-telegram-alert/1.0"},
+                 "apiKey": api_key, "User-Agent": "crypto-telegram-alert/1.0"},
     )
     open_url = opener or urllib.request.urlopen
     for attempt in range(3):
@@ -54,7 +54,12 @@ def _request(path: str, body: dict[str, Any], api_key: str,
             break
         except urllib.error.HTTPError as exc:
             # API key is sent only in a header; never log exception/body/header contents.
-            LOG.warning("[NANSEN] endpoint=%s HTTP %d", path, exc.code)
+            if exc.code == 401:
+                LOG.error("Nansen API authentication failed (HTTP 401)")
+            elif exc.code == 402:
+                LOG.error("Nansen API payment/credits required (HTTP 402)")
+            else:
+                LOG.warning("[NANSEN] endpoint=%s HTTP %d", path, exc.code)
             if (exc.code == 429 or exc.code >= 500) and attempt < 2:
                 try:
                     retry_after = float(exc.headers.get("Retry-After", 0)) if exc.headers else 0
@@ -80,7 +85,7 @@ def fetch_balances(address: str, api_key: str, *, opener: Callable[..., Any] | N
     page = 1
     while True:
         payload = _request(BALANCE_PATH, {"address": address, "chain": "solana",
-                                         "hide_spam_token": False,
+                                         "hide_spam_token": True,
                                          "pagination": {"page": page, "per_page": 1000}}, api_key, opener)
         data = payload.get("data")
         if not isinstance(data, list):
@@ -180,7 +185,7 @@ def normalize_balances(address: str, rows: list[dict[str, Any]], pnl: dict[str, 
         price, value = _number(row.get("price_usd")), _number(row.get("value_usd"))
         item = holdings.get(mint)
         if item is None:
-            item = {"mint": mint, "symbol": str(row.get("token_symbol") or ""),
+            item = {"chain": "solana", "mint": mint, "symbol": str(row.get("token_symbol") or ""),
                     "name": str(row.get("token_name") or row.get("token_symbol") or "Token não identificado"),
                     "amount": "0", "price_usd": str(price) if price is not None else None,
                     "value_usd": None, "pnl_usd": None, "pnl_percent": None,
@@ -201,22 +206,28 @@ def normalize_balances(address: str, rows: list[dict[str, Any]], pnl: dict[str, 
     for item in tokens:
         value = _number(item.get("value_usd"))
         item["allocation_percent"] = str(value * 100 / total) if value is not None and total else None
+    top = max((item for item in tokens if item.get("value_usd") is not None),
+              key=lambda item: _number(item["value_usd"]) or Decimal(0), default=None)
     return {"address": address, "sol": None, "sol_price_usd": None, "sol_value_usd": None,
             "tokens": tokens, "token_count": len(tokens), "unpriced_tokens": len(tokens) - priced,
-            "estimated_usd": str(total) if priced else None, "portfolio_total_usd": None,
+            "estimated_usd": str(total) if priced else ("0" if not tokens else None),
+            "portfolio_total_usd": str(total) if priced or not tokens else None,
+            "top_token": ({"mint": top["mint"], "symbol": top["symbol"], "name": top["name"],
+                           "value_usd": top["value_usd"]} if top else None),
             "is_partial": priced < len(tokens), "source": "nansen", "pnl_summary": pnl,
             "pnl_usd": None, "pnl_percent": None}
 
 
 def get_wallet_info(address: str, api_key: str | None = None, *, cache_seconds: int | None = None,
-                    opener: Callable[..., Any] | None = None, now: float | None = None) -> dict[str, Any]:
+                    opener: Callable[..., Any] | None = None, now: float | None = None,
+                    force_refresh: bool = False) -> dict[str, Any]:
     key = (api_key if api_key is not None else os.getenv("NANSEN_API_KEY", "")).strip()
     if not key:
         raise NansenError("NANSEN_API_KEY não configurada.")
     ttl = max(0, cache_seconds if cache_seconds is not None else _cache_seconds())
     timestamp = time.monotonic() if now is None else now
     cached = _BALANCE_CACHE.get(address)
-    if cached and timestamp - cached[0] < ttl:
+    if not force_refresh and cached and timestamp - cached[0] < ttl:
         return dict(cached[1])
     rows = fetch_balances(address, key, opener=opener)
     defi_entry = _DEFI_CACHE.get(address)
@@ -243,12 +254,9 @@ def get_wallet_info(address: str, api_key: str | None = None, *, cache_seconds: 
         _PNL_CACHE[address] = (timestamp, pnl)
     normalized = normalize_balances(address, rows, pnl)
     normalized["defi"] = defi
-    defi_total = _number((defi or {}).get("total_value_usd")) if defi else None
-    wallet_total = _number(normalized.get("estimated_usd"))
-    if wallet_total is None and normalized.get("token_count", 0) == 0:
-        wallet_total = Decimal(0)
-    normalized["portfolio_total_usd"] = str(wallet_total + defi_total) if wallet_total is not None and defi_total is not None else None
-    normalized["portfolio_total_is_partial"] = (defi_total is None or normalized.get("is_partial", False))
+    # The wallet snapshot and its total come only from this current-balance response.
+    # DeFi is a separate endpoint/snapshot and is intentionally not mixed into it.
+    normalized["portfolio_total_is_partial"] = normalized.get("is_partial", False)
     _BALANCE_CACHE[address] = (timestamp, normalized)
     return dict(normalized)
 

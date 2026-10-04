@@ -59,12 +59,14 @@ class NansenClientTests(unittest.TestCase):
         self.assertEqual(len(info["tokens"]), 21)
         self.assertEqual(len({x["mint"] for x in info["tokens"]}), 21)
         self.assertEqual(info["estimated_usd"], "422")
-        self.assertEqual(info["portfolio_total_usd"], "545")
+        self.assertEqual(info["portfolio_total_usd"], "422")
         self.assertEqual(info["source"], "nansen")
         self.assertEqual(info["tokens"][0]["pnl_usd"], None)
         self.assertEqual(info["pnl_summary"]["realized_pnl_usd"], 9.5)
         self.assertEqual([r[1]["pagination"]["page"] for r in requests if "current-balance" in r[0]], [1, 2])
         self.assertTrue(all(r[1]["chain"] == "solana" for r in requests if "chain" in r[1]))
+        self.assertTrue(all(r[1]["hide_spam_token"] is True for r in requests if "current-balance" in r[0]))
+        self.assertEqual(requests[0][0], "https://api.nansen.ai/api/v1/profiler/address/current-balance")
 
     def test_duplicate_ticker_mints_stay_separate_and_missing_values_remain_null(self):
         info = nansen.normalize_balances(ADDRESS, [
@@ -79,10 +81,49 @@ class NansenClientTests(unittest.TestCase):
         self.assertIsNone(info["tokens"][1]["value_usd"])
         self.assertIsNone(info["tokens"][1]["pnl_usd"])
 
+    def test_one_hundred_balances_are_paginated_and_top_is_valued_from_same_snapshot(self):
+        page_calls = []
+
+        def open_url(request, timeout):
+            if "current-balance" in request.full_url:
+                body = json.loads(request.data)
+                page = body["pagination"]["page"]
+                page_calls.append(page)
+                start = (page - 1) * 50
+                rows = [{"token_address": f"mint-{i}", "token_symbol": "SIGF" if i == 73 else f"T{i}",
+                         "token_name": f"Token {i}", "token_amount": 1,
+                         "price_usd": 10 if i == 73 else 1, "value_usd": 397.48 if i == 73 else 0.5}
+                        for i in range(start, start + 50)]
+                return Response({"data": rows, "pagination": {"page": page, "per_page": 50,
+                                                                  "is_last_page": page == 2}})
+            return Response({})
+
+        info = nansen.get_wallet_info(ADDRESS, "key", cache_seconds=0, opener=open_url, now=5)
+        self.assertEqual(len(info["tokens"]), 100)
+        self.assertEqual(page_calls, [1, 2])
+        self.assertEqual(info["top_token"]["symbol"], "SIGF")
+        self.assertEqual(info["top_token"]["value_usd"], "397.48")
+        self.assertEqual(info["portfolio_total_usd"], "446.98")
+
+    def test_force_refresh_bypasses_balance_cache(self):
+        calls = []
+
+        def open_url(request, timeout):
+            calls.append(request.full_url)
+            if "current-balance" in request.full_url:
+                return Response(balances([{"token_address": "mint", "token_symbol": "T",
+                                           "token_amount": 1, "value_usd": 1}]))
+            return Response({})
+
+        nansen.get_wallet_info(ADDRESS, "key", cache_seconds=60, opener=open_url, now=10)
+        nansen.get_wallet_info(ADDRESS, "key", cache_seconds=60, opener=open_url, now=11, force_refresh=True)
+        self.assertEqual(sum("current-balance" in call for call in calls), 2)
+
     def test_empty_wallet_is_a_valid_zero_holding_result(self):
         info = nansen.normalize_balances(ADDRESS, [])
         self.assertEqual(info["token_count"], 0)
-        self.assertIsNone(info["estimated_usd"])
+        self.assertEqual(info["estimated_usd"], "0")
+        self.assertEqual(info["portfolio_total_usd"], "0")
         self.assertEqual(info["tokens"], [])
 
     def test_defi_failure_keeps_wallet_total_explicitly_partial(self):
@@ -96,8 +137,8 @@ class NansenClientTests(unittest.TestCase):
 
         info = nansen.get_wallet_info(ADDRESS, "key", cache_seconds=0, opener=open_url, now=50)
         self.assertEqual(info["estimated_usd"], "5")
-        self.assertIsNone(info["portfolio_total_usd"])
-        self.assertTrue(info["portfolio_total_is_partial"])
+        self.assertEqual(info["portfolio_total_usd"], "5")
+        self.assertFalse(info["portfolio_total_is_partial"])
 
     def test_invalid_response_parsing_raises_safe_error(self):
         with self.assertRaises(nansen.NansenError):
@@ -201,15 +242,25 @@ class NansenClientTests(unittest.TestCase):
                     rpc.assert_not_called()
             with patch.object(nansen, "get_wallet_info", side_effect=nansen.NansenError("offline")):
                 with patch.object(wallet, "get_rpc_wallet_info", return_value={"source": "rpc"}) as rpc:
-                    self.assertEqual(wallet.get_wallet_info(ADDRESS, lambda _a: None)["source"], "rpc")
+                    self.assertEqual(wallet.get_wallet_info(ADDRESS, lambda _a: None)["source"], "rpc_fallback")
                     rpc.assert_called_once()
+
+    def test_rpc_only_assets_never_merge_into_nansen_holdings(self):
+        nansen_tokens = [{"mint": f"nansen-{i}", "symbol": f"N{i}"} for i in range(10)]
+        rpc_tokens = [{"mint": f"rpc-{i}", "symbol": f"R{i}"} for i in range(30)]
+        with patch.dict(os.environ, {"NANSEN_API_KEY": "fake", "NANSEN_ENABLED": "true"}):
+            with patch.object(nansen, "get_wallet_info", return_value={"source": "nansen", "tokens": nansen_tokens}):
+                with patch.object(wallet, "get_rpc_wallet_info", return_value={"source": "rpc", "tokens": rpc_tokens}) as rpc:
+                    result = wallet.get_wallet_info(ADDRESS, lambda _a: None)
+        self.assertEqual([item["mint"] for item in result["tokens"]], [item["mint"] for item in nansen_tokens])
+        rpc.assert_not_called()
 
     def test_missing_key_and_disabled_nansen_use_rpc_fallback(self):
         for env in ({"NANSEN_API_KEY": "", "NANSEN_ENABLED": "true"},
                     {"NANSEN_API_KEY": "fake", "NANSEN_ENABLED": "false"}):
             with self.subTest(env=env), patch.dict(os.environ, env, clear=False):
                 with patch.object(wallet, "get_rpc_wallet_info", return_value={"source": "rpc"}) as rpc:
-                    self.assertEqual(wallet.get_wallet_info(ADDRESS, lambda _a: None)["source"], "rpc")
+                    self.assertEqual(wallet.get_wallet_info(ADDRESS, lambda _a: None)["source"], "rpc_fallback")
                     rpc.assert_called_once()
 
     def test_configured_public_wallet_is_read_only_default_for_wallet_menu(self):

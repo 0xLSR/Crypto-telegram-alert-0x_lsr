@@ -226,18 +226,19 @@ def get_rpc_wallet_info(address: str, market_data: Callable[[str], dict[str, Any
             "sol_value_usd": str(sol_value) if sol_value is not None else None,
             "tokens": tokens, "token_count": len(token_accounts), "unpriced_tokens": unpriced_tokens,
             "estimated_usd": str(estimated) if estimated is not None else None,
-            "is_partial": unpriced_tokens > 0 or sol_value is None, "source": "rpc",
+            "is_partial": unpriced_tokens > 0 or sol_value is None, "source": "rpc_fallback",
             "portfolio_total_usd": None, "pnl_summary": None, "pnl_usd": None, "pnl_percent": None}
 
 
 def get_wallet_info(address: str, market_data: Callable[[str], dict[str, Any] | None] | None = None,
-                    market_data_many: Callable[[list[str]], dict[str, dict[str, Any]]] | None = None) -> dict[str, Any]:
+                    market_data_many: Callable[[list[str]], dict[str, dict[str, Any]]] | None = None,
+                    *, force_refresh: bool = False) -> dict[str, Any]:
     """Prefer Nansen Profiler balances; transparently fall back to public Solana RPC."""
     enabled = os.getenv("NANSEN_ENABLED", "true").strip().lower() not in {"0", "false", "no", "off"}
     api_key = os.getenv("NANSEN_API_KEY", "").strip()
     if enabled and api_key:
         try:
-            info = nansen_client.get_wallet_info(address, api_key)
+            info = nansen_client.get_wallet_info(address, api_key, force_refresh=force_refresh)
             _enrich_nansen_market_data(info, market_data_many)
             return info
         except nansen_client.NansenError as exc:
@@ -249,7 +250,9 @@ def get_wallet_info(address: str, market_data: Callable[[str], dict[str, Any] | 
         LOG.info("[WALLET] NANSEN_ENABLED=false; usando RPC configurado")
     if market_data is None:
         raise WalletRpcError("Dados Nansen indisponíveis e RPC sem serviço de cotação configurado.")
-    return get_rpc_wallet_info(address, market_data, market_data_many)
+    info = get_rpc_wallet_info(address, market_data, market_data_many)
+    info["source"] = "rpc_fallback"
+    return info
 
 
 def _enrich_nansen_market_data(info: dict[str, Any], market_data_many: Callable[[list[str]], dict[str, dict[str, Any]]] | None) -> None:
@@ -276,33 +279,13 @@ def _enrich_nansen_market_data(info: dict[str, Any], market_data_many: Callable[
             pair = quotes.get(item["mint"])
             if not isinstance(pair, dict):
                 continue
-            base = pair.get("baseToken") or {}
-            price = _price(pair.get("priceUsd"))
-            if item.get("price_usd") is None and price is not None:
-                item["price_usd"] = str(price)
-            if item.get("value_usd") is None and price is not None:
-                amount = _decimal(item.get("amount"))
-                if amount is not None:
-                    item["value_usd"] = str(amount * price)
+            # Market metrics may enrich display, but Nansen owns holdings and valuation.
             for key, value in (("market_cap", pair.get("marketCap")), ("fdv", pair.get("fdv")),
                                ("liquidity_usd", (pair.get("liquidity") or {}).get("usd")),
                                ("volume_24h", (pair.get("volume") or {}).get("h24")),
                                ("price_change_24h", (pair.get("priceChange") or {}).get("h24"))):
                 if item.get(key) is None and value is not None:
                     item[key] = value
-            if not item.get("name") and base.get("name"):
-                item["name"] = base["name"]
-            if not item.get("symbol") and base.get("symbol"):
-                item["symbol"] = base["symbol"]
-    priced = [item for item in tokens if item.get("value_usd") is not None]
-    values = [_decimal(item.get("value_usd")) for item in priced]
-    info["estimated_usd"] = str(sum((value for value in values if value is not None), Decimal(0))) if priced else None
-    info["unpriced_tokens"] = len(tokens) - len(priced)
-    info["is_partial"] = (info["unpriced_tokens"] > 0 or info.get("portfolio_total_is_partial", False))
-    total = _decimal(info.get("portfolio_total_usd")) or _decimal(info.get("estimated_usd"))
-    for item in tokens:
-        value = _decimal(item.get("value_usd"))
-        item["allocation_percent"] = str(value * 100 / total) if value is not None and total else None
 
 
 def extract_token_changes(transaction: dict[str, Any], wallet_address: str) -> list[dict[str, str]]:

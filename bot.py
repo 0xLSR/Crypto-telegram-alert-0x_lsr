@@ -805,7 +805,7 @@ def wallet_markup(wallet: dict[str, Any] | None, *, detail_page: int | None = No
     return {"inline_keyboard": rows}
 
 
-WALLET_DETAIL_PAGE_SIZE = 6
+WALLET_DETAIL_PAGE_SIZE = 10
 
 
 def wallet_info_text(address: str, info: dict[str, Any], wallet: dict[str, Any], *, details: bool = False,
@@ -815,7 +815,9 @@ def wallet_info_text(address: str, info: dict[str, Any], wallet: dict[str, Any],
     updated = time.strftime("%H:%M:%S", time.localtime())
     text = ("💼 MINHA CARTEIRA\n\n"
             f"Status: {status}\n\nCarteira: {wallet_short_address(address)}\n\n"
-            f"Fonte: {'Nansen Profiler' if info.get('source') == 'nansen' else 'RPC Solana'}\n")
+            f"Fonte: {'Nansen Profiler' if info.get('source') == 'nansen' else 'RPC (fallback)'}\n")
+    if info.get("source") == "rpc_fallback":
+        text += "⚠️ Dados via fallback RPC; lista não confirmada pela Nansen.\n"
     if info.get("sol") is not None:
         text += f"💰 Saldo SOL: {wallet_amount(info.get('sol'))} SOL\n"
     sol_price = info.get("sol_price_usd")
@@ -827,15 +829,17 @@ def wallet_info_text(address: str, info: dict[str, Any], wallet: dict[str, Any],
         text += f"Valor SOL: {wallet_usd(sol_value)}\n"
     total = info.get("portfolio_total_usd") if info.get("portfolio_total_usd") is not None else estimated
     text += f"\n💵 PATRIMÔNIO ESTIMADO: {wallet_usd(total) if total is not None else 'indisponível'}\n"
+    top_token = info.get("top_token")
+    if info.get("source") == "nansen" and top_token:
+        top_name = top_token.get("symbol") or top_token.get("name") or "Token"
+        text += f"🔥 Top token: {top_name} · {wallet_usd(top_token.get('value_usd'))}\n"
     defi = info.get("defi")
-    if defi and defi.get("total_value_usd") is not None:
-        text += f"🏦 Posições DeFi: {wallet_usd(defi['total_value_usd'])}\n"
-    elif info.get("source") == "nansen":
-        text += "⚠️ Total parcial: posições DeFi indisponíveis.\n"
+    if info.get("source") == "nansen" and defi and defi.get("total_value_usd") is not None:
+        text += f"🏦 DeFi (consulta separada; fora do patrimônio acima): {wallet_usd(defi['total_value_usd'])}\n"
     pnl_summary = info.get("pnl_summary") or {}
     if pnl_summary.get("realized_pnl_usd") is not None:
         text += f"📊 PnL realizado (90 dias): {wallet_usd(pnl_summary['realized_pnl_usd'])}\n"
-    text += f"🪙 Tokens: {int(info.get('token_count', 0))} ativos\n"
+    text += f"🪙 {int(info.get('token_count', 0))} ativos encontrados\n"
     unpriced = int(info.get("unpriced_tokens", 0) or 0)
     if unpriced:
         priced_count = max(0, int(info.get("token_count", 0)) - unpriced)
@@ -854,15 +858,13 @@ def wallet_info_text(address: str, info: dict[str, Any], wallet: dict[str, Any],
             text += "\n🪙 ATIVOS DA CARTEIRA\n"
             for index, item in enumerate(page_tokens, start=detail_page * WALLET_DETAIL_PAGE_SIZE + 1):
                 label = item.get("symbol") or item.get("name") or "Token não identificado"
-                text += f"\n{index}. {label}\nQuantidade: {wallet_amount(item.get('amount'))}\n"
-                if item.get("price_usd") is not None:
-                    text += f"Preço: {money(item['price_usd'])}\nValor: {wallet_usd(item.get('value_usd'))}\n"
-                else:
-                    text += "Preço: indisponível\nValor: indisponível\n"
-                if item.get("price_change_24h") is not None:
-                    text += f"Variação 24h: {signed_percent(item['price_change_24h'])}\n"
+                text += f"\n{index}. {label} · {wallet_amount(item.get('amount'))}\n"
+                text += f"Valor: {wallet_usd(item.get('value_usd'))}"
                 if item.get("allocation_percent") is not None:
-                    text += f"Participação: {wallet_percent(item['allocation_percent'])}%\n"
+                    text += f" · {wallet_percent(item['allocation_percent'])}%"
+                if item.get("price_usd") is not None:
+                    text += f" · preço {money(item['price_usd'])}"
+                text += "\n"
             if page_count > 1:
                 text += f"\nPágina {detail_page + 1} de {page_count}."
         else:
@@ -885,7 +887,7 @@ def wallet_menu_text(state: dict[str, Any], user_id: str | int, chat_id: str | i
                 "Cadastre o endereço público da sua carteira Solana para começar o monitoramento.", None)
     LOG.info("[WALLET] Checking wallet %s", wallet_short_address(wallet["address"]))
     info = solana_wallet.get_wallet_info(wallet["address"], get_market_data, get_gecko_pairs)
-    return wallet_info_text(wallet["address"], info, wallet), wallet
+    return wallet_info_text(wallet["address"], info, wallet, details=True), wallet
 
 
 def wallet_history_screen(wallet: dict[str, Any] | None) -> tuple[str, dict[str, Any]]:
@@ -1245,7 +1247,12 @@ def intelligence_entries_for_chat(state: dict[str, Any], chat_id: int | str, use
         try:
             info = solana_wallet.get_wallet_info(wallet_address, get_market_data, get_gecko_pairs)
             wallet_tokens = []
-            for item in info.get("tokens", []):
+            # Ownership context for Phase 3 comes only from Nansen-confirmed balances.
+            # The RPC fallback is useful in the wallet screen but must not add assets here.
+            source_tokens = info.get("tokens", []) if info.get("source") == "nansen" else []
+            if info.get("source") != "nansen":
+                LOG.info("[WALLET] Scanner omitted fallback balances; waiting for Nansen-confirmed holdings")
+            for item in source_tokens:
                 if not item.get("price_usd") or not is_valid_solana_address(item.get("mint")):
                     continue
                 wallet_tokens.append({
@@ -1764,8 +1771,10 @@ def handle_callback_update(update: dict[str, Any], state: dict[str, Any], token:
                     with STATE_LOCK:
                         state["wallets"][user_id]["last_check"] = wallet["last_check"]
                         save_state(state)
+                    pages = max(1, (len(info.get("tokens", [])) + WALLET_DETAIL_PAGE_SIZE - 1) // WALLET_DETAIL_PAGE_SIZE)
                     show_callback_screen(token, chat_id, callback_message,
-                                         wallet_info_text(wallet["address"], info, wallet), wallet_markup(wallet))
+                                         wallet_info_text(wallet["address"], info, wallet, details=True),
+                                         wallet_markup(wallet, detail_page=0, page_count=pages))
                 except solana_wallet.WalletRpcError as exc:
                     LOG.warning("[WALLET] RPC error for wallet %s: %s", wallet_short_address(wallet["address"]), exc)
                     show_callback_screen(token, chat_id, callback_message,
@@ -1778,7 +1787,8 @@ def handle_callback_update(update: dict[str, Any], state: dict[str, Any], token:
                 return
             try:
                 LOG.info("[WALLET] Checking wallet %s", wallet_short_address(wallet["address"]))
-                info = solana_wallet.get_wallet_info(wallet["address"], get_market_data, get_gecko_pairs)
+                info = solana_wallet.get_wallet_info(wallet["address"], get_market_data, get_gecko_pairs,
+                                                     force_refresh=data == "wallet_refresh")
                 wallet["last_check"] = time.time()
                 with STATE_LOCK:
                     state["wallets"][user_id]["last_check"] = wallet["last_check"]
