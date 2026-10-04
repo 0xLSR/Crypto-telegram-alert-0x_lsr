@@ -16,6 +16,14 @@ services:
         sync: false
       - key: TELEGRAM_ALLOWED_USER_IDS
         sync: false
+      - key: NANSEN_API_KEY
+        sync: false
+      - key: NANSEN_ENABLED
+        value: "true"
+      - key: NANSEN_WALLET_ADDRESS
+        value: "4fFKXHGqqBgbnCf8rre6GC7c4uEu7rmJ1Le7PfGp64uN"
+      - key: NANSEN_CACHE_SECONDS
+        value: "60"
       - key: ALERT_THRESHOLD_PERCENT
         value: "10"
       - key: ALERT_COOLDOWN_MINUTES

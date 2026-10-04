@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any
 
 import wallet as solana_wallet
+import nansen_client
 import market_intelligence as intelligence
 import market_flow as flow_analysis
 
@@ -708,6 +709,12 @@ def current_wallet(state: dict[str, Any], user_id: str | int, chat_id: str | int
         wallet = state.setdefault("wallets", {}).get(wallet_key(user_id))
         if wallet and wallet.get("chat_id") == str(chat_id):
             return dict(wallet)
+    # Optional public address configured by the repository owner. It is read-only
+    # and is not inserted into per-user state or used to send wallet alerts.
+    configured = os.getenv("NANSEN_WALLET_ADDRESS", "").strip()
+    if is_valid_solana_address(configured):
+        return {"address": configured, "chat_id": str(chat_id), "monitoring_enabled": False,
+                "configured_default": True}
     return None
 
 
@@ -733,9 +740,53 @@ def wallet_usd(value: Any) -> str:
     return f"${amount:,.2f}"
 
 
+def wallet_percent(value: Any) -> str:
+    try:
+        amount = Decimal(str(value)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    except (InvalidOperation, TypeError, ValueError):
+        return "indisponível"
+    return format(amount, ".2f")
+
+
+def wallet_token_position(address: str, mint: str) -> tuple[Decimal, int, dict[str, Any] | None]:
+    """Prefer normalized provider holdings; retain the public RPC balance fallback."""
+    if os.getenv("NANSEN_ENABLED", "true").strip().lower() not in {"0", "false", "no", "off"} and os.getenv("NANSEN_API_KEY", "").strip():
+        try:
+            info = solana_wallet.get_wallet_info(address, get_market_data, get_gecko_pairs)
+            for item in info.get("tokens", []):
+                if item.get("mint") == mint:
+                    pnl = None
+                    if info.get("source") == "nansen":
+                        try:
+                            pnl = nansen_client.get_token_pnl(address, mint)
+                        except nansen_client.NansenError as exc:
+                            LOG.info("[WALLET] PnL indisponível para mint %s: %s", wallet_short_address(mint), exc)
+                    if pnl:
+                        item.update(pnl)
+                        if item.get("pnl_percent") is not None:
+                            try:
+                                item["pnl_percent"] = str(Decimal(str(item["pnl_percent"])) * 100)
+                            except (InvalidOperation, TypeError, ValueError):
+                                item["pnl_percent"] = None
+                    return Decimal(str(item["amount"])), int(item.get("decimals", 0)), item
+            return Decimal(0), 0, None
+        except (solana_wallet.WalletRpcError, nansen_client.NansenError, InvalidOperation, TypeError, ValueError):
+            LOG.info("[WALLET] Posição Nansen indisponível para o mint %s; tentando RPC", wallet_short_address(mint))
+    amount, decimals = solana_wallet.get_token_balance(address, mint)
+    return amount, decimals, None
+
+
+def wallet_token_amount(address: str, mint: str) -> tuple[Decimal, int]:
+    amount, decimals, _item = wallet_token_position(address, mint)
+    return amount, decimals
+
+
 def wallet_markup(wallet: dict[str, Any] | None, *, detail_page: int | None = None, page_count: int = 0) -> dict[str, Any]:
     if not wallet:
         return {"inline_keyboard": [[button("➕ Cadastrar carteira", "wallet_add")], [button("⬅️ Voltar", "menu")]]}
+    if wallet.get("configured_default"):
+        return {"inline_keyboard": [[button("📊 Ver carteira", "wallet_view"), button("🔄 Atualizar", "wallet_refresh")],
+                                     [button("➕ Usar outra carteira", "wallet_add")], [button("⬅️ Voltar", "menu")]]}
     rows = []
     if detail_page is not None and page_count > 1:
         nav = []
@@ -759,11 +810,14 @@ WALLET_DETAIL_PAGE_SIZE = 6
 
 def wallet_info_text(address: str, info: dict[str, Any], wallet: dict[str, Any], *, details: bool = False,
                      detail_page: int = 0) -> str:
-    status = "🟢 Monitoramento ativo" if wallet.get("monitoring_enabled", True) else "⏸️ Monitoramento pausado"
+    status = ("🔒 Endereço padrão · somente leitura" if wallet.get("configured_default") else
+              "🟢 Monitoramento ativo" if wallet.get("monitoring_enabled", True) else "⏸️ Monitoramento pausado")
     updated = time.strftime("%H:%M:%S", time.localtime())
     text = ("💼 MINHA CARTEIRA\n\n"
             f"Status: {status}\n\nCarteira: {wallet_short_address(address)}\n\n"
-            f"💰 Saldo SOL: {wallet_amount(info.get('sol'))} SOL\n")
+            f"Fonte: {'Nansen Profiler' if info.get('source') == 'nansen' else 'RPC Solana'}\n")
+    if info.get("sol") is not None:
+        text += f"💰 Saldo SOL: {wallet_amount(info.get('sol'))} SOL\n"
     sol_price = info.get("sol_price_usd")
     if sol_price is not None:
         text += f"Preço SOL: {wallet_usd(sol_price)}\n"
@@ -771,7 +825,11 @@ def wallet_info_text(address: str, info: dict[str, Any], wallet: dict[str, Any],
     sol_value = info.get("sol_value_usd")
     if sol_value is not None:
         text += f"Valor SOL: {wallet_usd(sol_value)}\n"
-    text += f"\n💵 PATRIMÔNIO ESTIMADO: {wallet_usd(estimated) if estimated is not None else 'indisponível'}\n"
+    total = info.get("portfolio_total_usd") if info.get("portfolio_total_usd") is not None else estimated
+    text += f"\n💵 PATRIMÔNIO ESTIMADO: {wallet_usd(total) if total is not None else 'indisponível'}\n"
+    pnl_summary = info.get("pnl_summary") or {}
+    if pnl_summary.get("realized_pnl_usd") is not None:
+        text += f"📊 PnL realizado (90 dias): {wallet_usd(pnl_summary['realized_pnl_usd'])}\n"
     text += f"🪙 Tokens: {int(info.get('token_count', 0))} ativos\n"
     unpriced = int(info.get("unpriced_tokens", 0) or 0)
     if unpriced:
@@ -793,11 +851,19 @@ def wallet_info_text(address: str, info: dict[str, Any], wallet: dict[str, Any],
                     text += f"Preço: {money(item['price_usd'])}\nValor: {wallet_usd(item.get('value_usd'))}\n"
                 else:
                     text += "Preço: indisponível\nValor: indisponível\n"
+                if item.get("price_change_24h") is not None:
+                    text += f"Variação 24h: {signed_percent(item['price_change_24h'])}\n"
+                if item.get("allocation_percent") is not None:
+                    text += f"Participação: {wallet_percent(item['allocation_percent'])}%\n"
             if page_count > 1:
                 text += f"\nPágina {detail_page + 1} de {page_count}."
         else:
             text += "\nNenhum token SPL ativo encontrado.\n"
-        text += "\n📊 PnL\nIndisponível nesta versão\n"
+        text += "\n📊 PnL\n"
+        if pnl_summary.get("realized_pnl_usd") is not None:
+            text += f"PnL agregado realizado (90 dias): {wallet_usd(pnl_summary['realized_pnl_usd'])}\n"
+        else:
+            text += "PnL por posição/custo de aquisição: indisponível\n"
     checked = wallet.get("last_check")
     if isinstance(checked, (int, float)):
         updated = time.strftime("%H:%M:%S", time.localtime(checked))
@@ -1220,13 +1286,21 @@ def intelligence_single_screen(state: dict[str, Any], chat_id: int | str, addres
         tracked_wallet = current_wallet(state, user_id, chat_id)
         if tracked_wallet:
             try:
-                amount, _decimals = solana_wallet.get_token_balance(tracked_wallet["address"], address)
+                amount, _decimals, position = wallet_token_position(tracked_wallet["address"], address)
                 if amount > 0:
                     price = intelligence.number(pair.get("priceUsd"))
                     value = amount * Decimal(str(price)) if price is not None else None
                     text += (f"\n\n💼 SUA POSIÇÃO\nQuantidade: {wallet_amount(amount)}\n"
                              f"Valor: {wallet_usd(value) if value is not None else 'indisponível'}\n"
-                             "PnL: indisponível (não há custo de aquisição confiável).")
+                             + (f"Participação na carteira: {wallet_percent(position.get('allocation_percent'))}%\n"
+                                if position and position.get("allocation_percent") is not None else "")
+                             + (f"Investido (custo base): {wallet_usd(position['cost_basis_usd'])}\n"
+                                if position and position.get("cost_basis_usd") is not None else "")
+                             + (f"PnL não realizado: {wallet_usd(position['pnl_usd'])}"
+                                + (f" ({wallet_percent(position['pnl_percent'])}%)"
+                                   if position.get("pnl_percent") is not None else "")
+                                if position and position.get("pnl_usd") is not None else
+                                "PnL: indisponível por posição (sem custo de aquisição fornecido)."))
             except solana_wallet.WalletRpcError as exc:
                 LOG.info("[WALLET] Posição da carteira indisponível para análise: %s", exc)
     rows = [[button("🧠 Analisar", f"ia:{address}"), button("📈 Entrada", f"ie:{address}"),
@@ -1721,7 +1795,7 @@ def handle_callback_update(update: dict[str, Any], state: dict[str, Any], token:
         elif data == "wallet_add":
             if not user_id.isdigit():
                 show_callback_screen(token, chat_id, callback_message, "Não consegui identificar sua conta do Telegram.", back_markup())
-            elif current_wallet(state, user_id, chat_id):
+            elif current_wallet(state, user_id, chat_id) and not current_wallet(state, user_id, chat_id).get("configured_default"):
                 show_callback_screen(token, chat_id, callback_message, "Já existe uma carteira cadastrada nesta conversa.", wallet_markup(current_wallet(state, user_id, chat_id)))
             else:
                 begin_wallet_add(state, token, chat_id, user_id, callback_message)
@@ -1730,6 +1804,9 @@ def handle_callback_update(update: dict[str, Any], state: dict[str, Any], token:
             show_callback_screen(token, chat_id, callback_message, text, markup)
         elif data == "wallet_alerts":
             wallet = current_wallet(state, user_id, chat_id) if user_id.isdigit() else None
+            if wallet and wallet.get("configured_default"):
+                show_callback_screen(token, chat_id, callback_message, "Alertas de carteira exigem cadastrar o endereço nesta conversa.", wallet_markup(wallet))
+                return
             if not wallet:
                 show_callback_screen(token, chat_id, callback_message, "Nenhuma carteira cadastrada.", wallet_markup(None))
             else:
@@ -1740,6 +1817,9 @@ def handle_callback_update(update: dict[str, Any], state: dict[str, Any], token:
                                      {"inline_keyboard": [[button(toggle, "wallet_alert_toggle")], [button("⬅️ Voltar", "wallet_menu")]]})
         elif data == "wallet_alert_toggle":
             wallet = current_wallet(state, user_id, chat_id) if user_id.isdigit() else None
+            if wallet and wallet.get("configured_default"):
+                show_callback_screen(token, chat_id, callback_message, "Alertas de carteira exigem cadastrar o endereço nesta conversa.", wallet_markup(wallet))
+                return
             if not wallet:
                 show_callback_screen(token, chat_id, callback_message, "Nenhuma carteira cadastrada.", wallet_markup(None))
             else:
@@ -1754,6 +1834,9 @@ def handle_callback_update(update: dict[str, Any], state: dict[str, Any], token:
                                      {"inline_keyboard": [[button(toggle, "wallet_alert_toggle")], [button("⬅️ Voltar", "wallet_menu")]]})
         elif data == "wallet_remove":
             wallet = current_wallet(state, user_id, chat_id) if user_id.isdigit() else None
+            if wallet and wallet.get("configured_default"):
+                show_callback_screen(token, chat_id, callback_message, "Este endereço padrão é configurado pelo proprietário do bot.", wallet_markup(wallet))
+                return
             if not wallet:
                 show_callback_screen(token, chat_id, callback_message, "Nenhuma carteira cadastrada.", wallet_markup(None))
             else:
@@ -1763,6 +1846,9 @@ def handle_callback_update(update: dict[str, Any], state: dict[str, Any], token:
                                                            [button("⬅️ Voltar", "wallet_menu")]]})
         elif data == "wallet_remove_yes":
             wallet = current_wallet(state, user_id, chat_id) if user_id.isdigit() else None
+            if wallet and wallet.get("configured_default"):
+                show_callback_screen(token, chat_id, callback_message, "Este endereço padrão é configurado pelo proprietário do bot.", wallet_markup(wallet))
+                return
             if wallet:
                 with STATE_LOCK:
                     state["wallets"].pop(user_id, None)
@@ -2110,11 +2196,17 @@ def check_prices(state: dict[str, Any], token: str, threshold: float, cooldown: 
                             if str(wallet_entry.get("chat_id")) != str(chat_id):
                                 continue
                             try:
-                                amount, _decimals = solana_wallet.get_token_balance(wallet_entry["address"], address)
+                                amount, _decimals, position = wallet_token_position(wallet_entry["address"], address)
                                 market_price = Decimal(str(pair["priceUsd"]))
                                 if amount > 0 and market_price.is_finite() and market_price > 0:
                                     personalized_text += (f"\n\n💼 ALERTA DA SUA CARTEIRA\nSua posição: {wallet_amount(amount)} tokens · "
-                                                         f"{wallet_usd(amount * market_price)}. PnL indisponível sem custo de aquisição confiável.")
+                                                         f"{wallet_usd(amount * market_price)}.")
+                                    if position and position.get("pnl_usd") is not None:
+                                        personalized_text += f"\nPnL não realizado: {wallet_usd(position['pnl_usd'])}"
+                                        if position.get("pnl_percent") is not None:
+                                            personalized_text += f" ({wallet_percent(position['pnl_percent'])}%)"
+                                    else:
+                                        personalized_text += "\nPnL por posição: indisponível."
                             except (solana_wallet.WalletRpcError, InvalidOperation, TypeError, ValueError) as exc:
                                 LOG.info("[WALLET] Não foi possível anexar posição ao alerta inteligente: %s", exc)
                         try:
@@ -2129,11 +2221,17 @@ def check_prices(state: dict[str, Any], token: str, threshold: float, cooldown: 
                             if str(wallet_entry.get("chat_id")) != str(chat_id):
                                 continue
                             try:
-                                amount, _decimals = solana_wallet.get_token_balance(wallet_entry["address"], address)
+                                amount, _decimals, position = wallet_token_position(wallet_entry["address"], address)
                                 market_price = Decimal(str(pair["priceUsd"]))
                                 if amount > 0 and market_price.is_finite() and market_price > 0:
                                     personalized_text = ("🚨 ALERTA DA SUA POSIÇÃO\n\n" + personalized_text
-                                                         + f"\n\n💼 Valor atual: {wallet_usd(amount * market_price)}. PnL indisponível sem custo de aquisição.")
+                                                         + f"\n\n💼 Valor atual: {wallet_usd(amount * market_price)}.")
+                                    if position and position.get("pnl_usd") is not None:
+                                        personalized_text += f"\nPnL não realizado: {wallet_usd(position['pnl_usd'])}"
+                                        if position.get("pnl_percent") is not None:
+                                            personalized_text += f" ({wallet_percent(position['pnl_percent'])}%)"
+                                    else:
+                                        personalized_text += "\nPnL por posição: indisponível."
                             except (solana_wallet.WalletRpcError, InvalidOperation, TypeError, ValueError) as exc:
                                 LOG.info("[WALLET] Não foi possível anexar posição ao alerta de fluxo: %s", exc)
                         try:

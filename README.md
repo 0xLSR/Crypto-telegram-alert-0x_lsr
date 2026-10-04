@@ -13,15 +13,21 @@ Bot de alertas Telegram para tokens Solana, usando primeiro a API pública do [G
 
 Os botões de navegação editam a mensagem atual, confirmam callbacks imediatamente e usam identificadores curtos, sem endereços completos nos dados do callback. A lista é paginada em grupos de dez tokens. O menu de comandos nativo do Telegram é configurado na inicialização com `/start`, `/price`, `/list`, `/watch`, `/unwatch` e `/help`, em português; aliases continuam aceitos como compatibilidade, sem aparecer no menu.
 
-## Minha carteira — Fase 2 somente leitura
+## Minha carteira — Nansen Profiler + fallback somente leitura
 
 No Telegram, abra **/start → 💼 Minha carteira → ➕ Cadastrar carteira** e envie somente o endereço público Solana. O cadastro é validado e associado ao seu ID e chat do Telegram. Não envie seed phrase, chave privada ou qualquer credencial; o bot não armazena chaves, assina nem envia transações.
 
 Se essa for a carteira que você usa no FOMO, informe o endereço público dela. O bot observa a blockchain pelo endereço e não presume vínculo nem usa uma API oficial do FOMO.
 
-A carteira é consultada por RPC público Solana para saldo SOL, contas de tokens SPL e assinaturas recentes. Movimentações aparecem como **🔄 Movimentação detectada** porque RPC público não prova com segurança se uma operação foi compra, venda, swap ou transferência. Os alertas incluem link Solscan; valores USD de tokens usam as fontes de mercado já existentes quando há cotação e, nos demais casos, aparecem como indisponíveis. PnL fica indisponível nesta versão. O histórico mantém até 20 movimentações por carteira.
+A carteira usa primeiro o endpoint oficial Nansen Profiler `POST /api/v1/profiler/address/current-balance`, com paginação para incluir todos os saldos retornados, e recorre ao RPC público Solana se Nansen estiver desativada, sem chave ou indisponível. GeckoTerminal/DexScreener continuam responsáveis por dados de mercado, e o GeckoTerminal segue sendo a fonte do Whale Flow. A consulta Nansen de saldo é um snapshot público; o bot não faz scraping nem chama APIs internas. O preço/valor USD é o campo retornado pela Nansen; dados ausentes ficam indisponíveis. Capitalização, liquidez e variação 24h não fazem parte do endpoint de saldo e continuam N/D sem dados de mercado associados.
 
-Nenhuma nova Secret é necessária. `SOLANA_RPC_URL` é opcional e usa `https://api.mainnet-beta.solana.com` por padrão; `WALLET_CHECK_INTERVAL_SECONDS` é opcional e vale `60` segundos por padrão (aceita de 15 a 3600). Preços USD usam GeckoTerminal e o fallback DexScreener já configurados no bot.
+O endpoint oficial `POST /api/v1/profiler/address/pnl-summary` pode fornecer estatísticas agregadas de PnL realizado para os últimos 90 dias; isso não é PnL de 24h. Para um mint específico, o bot consulta sob demanda `POST /api/v1/profiler/address/pnl` e usa apenas os campos de PnL não realizado, ROI e custo de aquisição que a API retornar; essa consulta é cacheada por 24 h. Sem esses campos, a posição continua sem PnL/custo base inventado. A API de saldos não fornece histórico; transações e movimentos continuam sendo lidos pelo RPC, sem classificar compra/venda quando não há evidência suficiente.
+
+Configure `NANSEN_API_KEY` nos GitHub **Settings → Secrets and variables → Actions → New repository secret**. Configure `NANSEN_ENABLED` e `NANSEN_WALLET_ADDRESS` como Actions Variables (o endereço padrão é público e pode ser sobrescrito). Sem API key, a carteira volta ao RPC automaticamente. `NANSEN_CACHE_SECONDS` controla o cache de holdings (padrão 60 s); o resumo agregado de PnL tem cache de 24 h para limitar consumo. A Nansen cobra 1 crédito por chamada de saldo e 1 por chamada PnL; a documentação lista 10 créditos/dia no plano gratuito. Verifique os créditos/plano atuais antes de habilitar chamadas recorrentes. [Endpoint de saldo](https://docs.nansen.ai/api/profiler/address-current-balances) · [PnL](https://docs.nansen.ai/api/profiler/address-pnl-and-trade-performance) · [Créditos e limites](https://docs.nansen.ai/getting-started/credits).
+
+O endereço padrão configurado em `NANSEN_WALLET_ADDRESS` pode ser visualizado em modo somente leitura por chats autorizados. Para alertas e monitoramento de transações por usuário, cadastre a carteira no próprio chat. Posições são correlacionadas com a Fase 3 usando mint (não ticker); a inteligência de mercado continua sendo calculada com dados de GeckoTerminal/DexScreener e Whale Flow permanece baseado em trades de pools GeckoTerminal.
+
+`NANSEN_API_KEY` é opcional para habilitar a fonte prioritária. `NANSEN_ENABLED` vale `true`, `NANSEN_WALLET_ADDRESS` usa o endereço público padrão acima e `NANSEN_CACHE_SECONDS` vale 60. `SOLANA_RPC_URL` é opcional e usa `https://api.mainnet-beta.solana.com` por padrão; `WALLET_CHECK_INTERVAL_SECONDS` vale 60 segundos (15–3600). A integração nunca pede chave privada/seed, assina ou envia transações.
 
 ## Inteligência de mercado — Fase 3 somente analítica
 
@@ -108,6 +114,6 @@ O estado local é `data/state.json`. Em produção, o Blueprint aponta para o di
 ## Testes
 
 ```sh
-python -m py_compile bot.py wallet.py market_flow.py market_intelligence.py tests/test_telegram_api.py tests/test_wallet.py tests/test_market_flow.py tests/test_market_intelligence.py
+python -m py_compile bot.py wallet.py nansen_client.py market_flow.py market_intelligence.py tests/test_telegram_api.py tests/test_wallet.py tests/test_nansen_client.py tests/test_market_flow.py tests/test_market_intelligence.py
 python -m unittest discover -s tests -v
 ```
