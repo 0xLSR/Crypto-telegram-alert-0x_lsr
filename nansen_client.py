@@ -15,8 +15,10 @@ LOG = logging.getLogger("crypto_alert_bot.nansen")
 BASE_URL = "https://api.nansen.ai/api/v1"
 BALANCE_PATH = "/profiler/address/current-balance"
 PNL_PATH = "/profiler/address/pnl-summary"
+DEFI_PATH = "/portfolio/defi-holdings"
 _BALANCE_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
 _PNL_CACHE: dict[str, tuple[float, dict[str, Any] | None]] = {}
+_DEFI_CACHE: dict[str, tuple[float, dict[str, Any] | None]] = {}
 _TOKEN_PNL_CACHE: dict[tuple[str, str], tuple[float, Any]] = {}
 _PNL_ERROR = object()
 
@@ -128,6 +130,19 @@ def fetch_token_pnl(address: str, mint: str, api_key: str, *, opener: Callable[.
     return None
 
 
+def fetch_defi_holdings(address: str, api_key: str, *, opener: Callable[..., Any] | None = None) -> dict[str, Any] | None:
+    """Read Nansen's documented DeFi positions and summary for a wallet."""
+    result = _request(DEFI_PATH, {"wallet_address": address}, api_key, opener)
+    summary = result.get("summary")
+    if not isinstance(summary, dict):
+        return None
+    total = _number(summary.get("total_value_usd"))
+    return {"total_value_usd": str(total) if total is not None else None,
+            "protocol_count": summary.get("protocol_count"),
+            "token_count": summary.get("token_count"),
+            "protocols": result.get("protocols") if isinstance(result.get("protocols"), list) else []}
+
+
 def get_token_pnl(address: str, mint: str, api_key: str | None = None, *,
                   cache_seconds: int = 86400, opener: Callable[..., Any] | None = None,
                   now: float | None = None) -> dict[str, Any] | None:
@@ -204,6 +219,17 @@ def get_wallet_info(address: str, api_key: str | None = None, *, cache_seconds: 
     if cached and timestamp - cached[0] < ttl:
         return dict(cached[1])
     rows = fetch_balances(address, key, opener=opener)
+    defi_entry = _DEFI_CACHE.get(address)
+    defi_ttl = max(ttl, 86400) if defi_entry and defi_entry[1] is not None else max(ttl, 300)
+    if defi_entry and timestamp - defi_entry[0] < defi_ttl:
+        defi = defi_entry[1]
+    else:
+        try:
+            defi = fetch_defi_holdings(address, key, opener=opener)
+        except NansenError as exc:
+            LOG.info("[NANSEN] DeFi holdings indisponíveis (%s); patrimônio DeFi não será somado", str(exc))
+            defi = None
+        _DEFI_CACHE[address] = (timestamp, defi)
     pnl_entry = _PNL_CACHE.get(address)
     pnl_ttl = max(ttl, 86400) if pnl_entry and pnl_entry[1] is not None else max(ttl, 300)
     if pnl_entry and timestamp - pnl_entry[0] < pnl_ttl:
@@ -216,6 +242,13 @@ def get_wallet_info(address: str, api_key: str | None = None, *, cache_seconds: 
             pnl = None
         _PNL_CACHE[address] = (timestamp, pnl)
     normalized = normalize_balances(address, rows, pnl)
+    normalized["defi"] = defi
+    defi_total = _number((defi or {}).get("total_value_usd")) if defi else None
+    wallet_total = _number(normalized.get("estimated_usd"))
+    if wallet_total is None and normalized.get("token_count", 0) == 0:
+        wallet_total = Decimal(0)
+    normalized["portfolio_total_usd"] = str(wallet_total + defi_total) if wallet_total is not None and defi_total is not None else None
+    normalized["portfolio_total_is_partial"] = (defi_total is None or normalized.get("is_partial", False))
     _BALANCE_CACHE[address] = (timestamp, normalized)
     return dict(normalized)
 

@@ -34,6 +34,7 @@ class NansenClientTests(unittest.TestCase):
     def setUp(self):
         nansen._BALANCE_CACHE.clear()
         nansen._PNL_CACHE.clear()
+        nansen._DEFI_CACHE.clear()
         nansen._TOKEN_PNL_CACHE.clear()
 
     def test_official_balance_pages_all_holdings_and_does_not_cut_at_twenty(self):
@@ -44,6 +45,8 @@ class NansenClientTests(unittest.TestCase):
             requests.append((request.full_url, body, timeout))
             if "pnl-summary" in request.full_url:
                 return Response({"realized_pnl_usd": 9.5, "realized_pnl_percent": 0.2})
+            if "defi-holdings" in request.full_url:
+                return Response({"summary": {"total_value_usd": 123, "protocol_count": 2}, "protocols": []})
             if body["pagination"]["page"] == 1:
                 return Response(balances([{"token_address": f"mint{i}", "token_symbol": "DUP",
                                           "token_name": f"Token {i}", "token_amount": i + 1,
@@ -56,11 +59,12 @@ class NansenClientTests(unittest.TestCase):
         self.assertEqual(len(info["tokens"]), 21)
         self.assertEqual(len({x["mint"] for x in info["tokens"]}), 21)
         self.assertEqual(info["estimated_usd"], "422")
+        self.assertEqual(info["portfolio_total_usd"], "545")
         self.assertEqual(info["source"], "nansen")
         self.assertEqual(info["tokens"][0]["pnl_usd"], None)
         self.assertEqual(info["pnl_summary"]["realized_pnl_usd"], 9.5)
         self.assertEqual([r[1]["pagination"]["page"] for r in requests if "current-balance" in r[0]], [1, 2])
-        self.assertTrue(all(r[1]["chain"] == "solana" for r in requests))
+        self.assertTrue(all(r[1]["chain"] == "solana" for r in requests if "chain" in r[1]))
 
     def test_duplicate_ticker_mints_stay_separate_and_missing_values_remain_null(self):
         info = nansen.normalize_balances(ADDRESS, [
@@ -80,6 +84,20 @@ class NansenClientTests(unittest.TestCase):
         self.assertEqual(info["token_count"], 0)
         self.assertIsNone(info["estimated_usd"])
         self.assertEqual(info["tokens"], [])
+
+    def test_defi_failure_keeps_wallet_total_explicitly_partial(self):
+        def open_url(request, timeout):
+            if "current-balance" in request.full_url:
+                return Response(balances([{"token_address": "mint", "token_symbol": "T",
+                                          "token_amount": 1, "price_usd": 5, "value_usd": 5}]))
+            if "defi-holdings" in request.full_url:
+                raise urllib.error.HTTPError(request.full_url, 403, "x", {}, io.BytesIO(b"restricted"))
+            return Response({})
+
+        info = nansen.get_wallet_info(ADDRESS, "key", cache_seconds=0, opener=open_url, now=50)
+        self.assertEqual(info["estimated_usd"], "5")
+        self.assertIsNone(info["portfolio_total_usd"])
+        self.assertTrue(info["portfolio_total_is_partial"])
 
     def test_invalid_response_parsing_raises_safe_error(self):
         with self.assertRaises(nansen.NansenError):
@@ -171,9 +189,9 @@ class NansenClientTests(unittest.TestCase):
         first = nansen.get_wallet_info(ADDRESS, "key", cache_seconds=60, opener=open_url, now=10)
         second = nansen.get_wallet_info(ADDRESS, "key", cache_seconds=60, opener=open_url, now=20)
         self.assertEqual(first, second)
-        self.assertEqual(len(calls), 2)  # one holdings + one daily PnL request
+        self.assertEqual(len(calls), 3)  # holdings + DeFi + aggregate PnL
         nansen.get_wallet_info(ADDRESS, "key", cache_seconds=60, opener=open_url, now=71)
-        self.assertEqual(len(calls), 3)  # holdings expired; 24h PnL cache did not
+        self.assertEqual(len(calls), 4)  # holdings expired; 24h PnL and DeFi caches did not
 
     def test_configured_provider_uses_nansen_and_rpc_when_nansen_unavailable(self):
         with patch.dict(os.environ, {"NANSEN_API_KEY": "fake", "NANSEN_ENABLED": "true"}):

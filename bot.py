@@ -827,6 +827,11 @@ def wallet_info_text(address: str, info: dict[str, Any], wallet: dict[str, Any],
         text += f"Valor SOL: {wallet_usd(sol_value)}\n"
     total = info.get("portfolio_total_usd") if info.get("portfolio_total_usd") is not None else estimated
     text += f"\n💵 PATRIMÔNIO ESTIMADO: {wallet_usd(total) if total is not None else 'indisponível'}\n"
+    defi = info.get("defi")
+    if defi and defi.get("total_value_usd") is not None:
+        text += f"🏦 Posições DeFi: {wallet_usd(defi['total_value_usd'])}\n"
+    elif info.get("source") == "nansen":
+        text += "⚠️ Total parcial: posições DeFi indisponíveis.\n"
     pnl_summary = info.get("pnl_summary") or {}
     if pnl_summary.get("realized_pnl_usd") is not None:
         text += f"📊 PnL realizado (90 dias): {wallet_usd(pnl_summary['realized_pnl_usd'])}\n"
@@ -834,9 +839,12 @@ def wallet_info_text(address: str, info: dict[str, Any], wallet: dict[str, Any],
     unpriced = int(info.get("unpriced_tokens", 0) or 0)
     if unpriced:
         priced_count = max(0, int(info.get("token_count", 0)) - unpriced)
-        text += f"\n⚠️ {unpriced} token(s) sem cotação\nValor considera SOL e {priced_count} token(s) com preço disponível.\n"
+        if info.get("source") == "nansen":
+            text += f"\n⚠️ {unpriced} token(s) sem cotação\nTotal inclui os {priced_count} tokens valorizados; os demais ficaram de fora.\n"
+        else:
+            text += f"\n⚠️ {unpriced} token(s) sem cotação\nValor considera SOL e {priced_count} token(s) com preço disponível.\n"
     elif info.get("is_partial"):
-        text += "\n⚠️ Estimativa parcial: preço do SOL indisponível.\n"
+        text += "\n⚠️ Patrimônio parcial: nem todos os ativos/posições têm valor disponível.\n"
     if details:
         tokens = info.get("tokens", [])
         if tokens:

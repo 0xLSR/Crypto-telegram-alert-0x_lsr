@@ -298,7 +298,7 @@ def _enrich_nansen_market_data(info: dict[str, Any], market_data_many: Callable[
     values = [_decimal(item.get("value_usd")) for item in priced]
     info["estimated_usd"] = str(sum((value for value in values if value is not None), Decimal(0))) if priced else None
     info["unpriced_tokens"] = len(tokens) - len(priced)
-    info["is_partial"] = info["unpriced_tokens"] > 0
+    info["is_partial"] = (info["unpriced_tokens"] > 0 or info.get("portfolio_total_is_partial", False))
     total = _decimal(info.get("portfolio_total_usd")) or _decimal(info.get("estimated_usd"))
     for item in tokens:
         value = _decimal(item.get("value_usd"))
